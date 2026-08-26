@@ -34,7 +34,6 @@ RUN pnpm build:packages \
 FROM node:20-bookworm-slim AS runtime
 WORKDIR /app
 
-ENV NODE_ENV=production
 ENV PORT=3000
 
 RUN apt-get update \
@@ -56,8 +55,8 @@ COPY packages/platform-core/package.json ./packages/platform-core/
 RUN mkdir -p apps/collector-electron \
   && printf '%s\n' '{"name":"@aiecom/collector-electron","version":"1.0.0","private":true}' > apps/collector-electron/package.json
 
-# 需带上 prisma / tsx（在根 package 的 devDependencies），供 migrate 与可选 seed
-RUN pnpm install --frozen-lockfile \
+# NODE_ENV=production 时 pnpm 会跳过 devDependencies（prisma/tsx 在里面）
+RUN pnpm install --frozen-lockfile --prod=false \
   && pnpm exec prisma generate --schema=prisma/schema.prisma
 
 COPY --from=build /app/packages/shared/dist ./packages/shared/dist
@@ -69,6 +68,8 @@ COPY --from=build /app/apps/api/dist ./apps/api/dist
 COPY deploy/api-entrypoint.sh /app/deploy/api-entrypoint.sh
 
 RUN chmod +x /app/deploy/api-entrypoint.sh
+
+ENV NODE_ENV=production
 
 EXPOSE 3000
 VOLUME ["/app/uploads"]
