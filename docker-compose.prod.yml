@@ -1,19 +1,23 @@
 # 生产编排：Postgres + Redis + API + Web(Nginx)
+# 兼容 docker-compose 1.x（旧版）与 Docker Compose V2
 # 用法：
-#   cp deploy/.env.prod.example .env.prod   # 改密钥与域名
+#   cp deploy/.env.prod.example .env.prod
+#   # 旧版若无 --env-file，可再：cp .env.prod .env
 #   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#   # 或：docker-compose -f docker-compose.prod.yml up -d --build
 #
-# 外层建议再用宿主机 Nginx/Caddy 做 HTTPS，反代到本机 8080（或改 WEB_PUBLISH_PORT）
+# 外层可用宿主机 Nginx 做 HTTPS，反代到本机 8080（或改 WEB_PUBLISH_PORT）
 
-name: aiecom-prod
+version: "3.8"
 
 services:
   postgres:
     image: postgres:16-alpine
+    container_name: aiecom-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-aiecom}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-aiecom}
     volumes:
       - aiecom_pg_data:/var/lib/postgresql/data
@@ -27,6 +31,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    container_name: aiecom-redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
@@ -43,15 +48,16 @@ services:
     build:
       context: .
       dockerfile: deploy/Dockerfile.api
+    container_name: aiecom-api
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-aiecom}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-aiecom}?schema=public
       REDIS_URL: redis://redis:6379
       PORT: "3000"
-      WEB_ORIGIN: ${WEB_ORIGIN:?set WEB_ORIGIN e.g. https://your.domain}
-      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+      WEB_ORIGIN: ${WEB_ORIGIN}
+      JWT_SECRET: ${JWT_SECRET}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
-      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:?set CREDENTIAL_ENCRYPTION_KEY}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_MODEL: ${LLM_MODEL:-}
@@ -70,10 +76,8 @@ services:
     volumes:
       - aiecom_uploads:/app/uploads
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - postgres
+      - redis
     networks:
       - internal
 
@@ -81,6 +85,7 @@ services:
     build:
       context: .
       dockerfile: deploy/Dockerfile.web
+    container_name: aiecom-web
     restart: unless-stopped
     ports:
       - "${WEB_PUBLISH_PORT:-8080}:80"

@@ -50,7 +50,11 @@ cp deploy/.env.prod.example .env.prod
 # 编辑 .env.prod：POSTGRES_PASSWORD、JWT_SECRET、CREDENTIAL_ENCRYPTION_KEY、WEB_ORIGIN、LLM_*
 # 首次可临时 RUN_SEED=true，启动成功后改回 false
 
-docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+# 旧版 docker-compose（带连字符）不支持 --env-file 时，再复制一份为 .env：
+cp .env.prod .env
+
+docker-compose -f docker-compose.prod.yml up -d --build
+# 新版也可用：docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
 # 或：pnpm prod:up
 ```
 
@@ -72,10 +76,11 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
 ### 5. 常用命令
 
 ```bash
-pnpm prod:logs          # 看日志
+pnpm prod:logs          # 看日志（需已有根目录 .env）
 pnpm prod:down          # 停止
 # 发版：拉代码后
-docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+cp .env.prod .env       # 若只用 .env.prod，发版前同步一次
+docker-compose -f docker-compose.prod.yml up -d --build
 ```
 
 CSV 上传落在 Docker 卷 `aiecom_uploads`。上架全局并发见 `WB_LISTING_CONCURRENCY`（默认 4，同店串行）。

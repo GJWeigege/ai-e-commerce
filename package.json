@@ -12,9 +12,9 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:seed": "tsx prisma/seed.ts",
     "db:setup": "prisma migrate dev --name init && tsx prisma/seed.ts",
-    "prod:up": "docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build",
-    "prod:down": "docker compose -f docker-compose.prod.yml --env-file .env.prod down",
-    "prod:logs": "docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f --tail=200"
+    "prod:up": "docker-compose -f docker-compose.prod.yml up -d --build",
+    "prod:down": "docker-compose -f docker-compose.prod.yml down",
+    "prod:logs": "docker-compose -f docker-compose.prod.yml logs -f --tail=200"
   },
   "dependencies": {
     "@prisma/client": "^6.14.0",
