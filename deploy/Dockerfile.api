@@ -56,9 +56,8 @@ COPY packages/platform-core/package.json ./packages/platform-core/
 RUN mkdir -p apps/collector-electron \
   && printf '%s\n' '{"name":"@aiecom/collector-electron","version":"1.0.0","private":true}' > apps/collector-electron/package.json
 
-# 生产依赖 + 迁移/种子所需 CLI（体积可接受）
-RUN pnpm install --frozen-lockfile --prod \
-  && pnpm add -w -D tsx@4.20.0 prisma@6.14.0 \
+# 需带上 prisma / tsx（在根 package 的 devDependencies），供 migrate 与可选 seed
+RUN pnpm install --frozen-lockfile \
   && pnpm exec prisma generate --schema=prisma/schema.prisma
 
 COPY --from=build /app/packages/shared/dist ./packages/shared/dist
