@@ -14,11 +14,13 @@ COPY prisma ./prisma
 COPY apps/api/package.json ./apps/api/
 COPY apps/web/package.json ./apps/web/
 COPY apps/collector-extension/package.json ./apps/collector-extension/
-COPY apps/collector-electron/package.json ./apps/collector-electron/
 COPY packages/shared/package.json ./packages/shared/
 COPY packages/collector-core/package.json ./packages/collector-core/
 COPY packages/llm-core/package.json ./packages/llm-core/
 COPY packages/platform-core/package.json ./packages/platform-core/
+# 不构建 Electron；仅占位满足 pnpm workspace / lockfile
+RUN mkdir -p apps/collector-electron \
+  && printf '%s\n' '{"name":"@aiecom/collector-electron","version":"1.0.0","private":true}' > apps/collector-electron/package.json
 
 RUN pnpm install --frozen-lockfile
 
@@ -47,11 +49,12 @@ COPY prisma ./prisma
 COPY apps/api/package.json ./apps/api/
 COPY apps/web/package.json ./apps/web/
 COPY apps/collector-extension/package.json ./apps/collector-extension/
-COPY apps/collector-electron/package.json ./apps/collector-electron/
 COPY packages/shared/package.json ./packages/shared/
 COPY packages/collector-core/package.json ./packages/collector-core/
 COPY packages/llm-core/package.json ./packages/llm-core/
 COPY packages/platform-core/package.json ./packages/platform-core/
+RUN mkdir -p apps/collector-electron \
+  && printf '%s\n' '{"name":"@aiecom/collector-electron","version":"1.0.0","private":true}' > apps/collector-electron/package.json
 
 # 生产依赖 + 迁移/种子所需 CLI（体积可接受）
 RUN pnpm install --frozen-lockfile --prod \
