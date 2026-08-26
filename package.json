@@ -1,0 +1,32 @@
+{
+  "name": "ai-e-commerce",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "dev:api": "pnpm --filter @aiecom/shared --filter @aiecom/collector-core --filter @aiecom/llm-core --filter @aiecom/platform-core build && pnpm --filter @aiecom/api start:dev",
+    "build:packages": "pnpm --filter @aiecom/shared --filter @aiecom/collector-core --filter @aiecom/llm-core --filter @aiecom/platform-core build",
+    "dev:web": "pnpm --filter @aiecom/web dev",
+    "build": "pnpm -r --if-present build",
+    "test": "pnpm --filter @aiecom/api test",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:seed": "tsx prisma/seed.ts",
+    "db:setup": "prisma migrate dev --name init && tsx prisma/seed.ts",
+    "prod:up": "docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build",
+    "prod:down": "docker compose -f docker-compose.prod.yml --env-file .env.prod down",
+    "prod:logs": "docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f --tail=200"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.14.0",
+    "bcryptjs": "^2.4.3"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "prisma": "^6.14.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.3"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  }
+}

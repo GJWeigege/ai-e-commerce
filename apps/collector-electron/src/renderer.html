@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Ozon Electron 采集端</title>
+    <style>
+      body { font-family: sans-serif; margin: 24px; }
+      label { display: block; margin: 8px 0 4px; }
+      input { width: 100%; padding: 8px; }
+      button { margin-right: 8px; margin-top: 12px; }
+      pre { background: #111; color: #9f9; padding: 12px; height: 280px; overflow: auto; }
+    </style>
+  </head>
+  <body>
+    <h2>Ozon Electron 采集端</h2>
+    <p>先登录后台拿到 Token，再打开 Ozon 复用会话，然后开始轮询任务。</p>
+    <label>API 地址</label>
+    <input id="api" value="http://localhost:3000/api/v1" />
+    <label>JWT Token</label>
+    <input id="token" />
+    <label>工作租户 ID（超管必填）</label>
+    <input id="tenant" />
+    <label>Agent Key</label>
+    <input id="agentKey" value="electron-local-1" />
+    <div>
+      <button id="login">打开 Ozon 登录</button>
+      <button id="start">开始轮询</button>
+      <button id="stop">停止</button>
+    </div>
+    <pre id="log"></pre>
+    <script>
+      const logEl = document.getElementById('log');
+      let timer = null;
+      function log(msg) {
+        logEl.textContent = new Date().toISOString() + ' ' + msg + '\n' + logEl.textContent;
+      }
+      async function api(path, options) {
+        const headers = {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + document.getElementById('token').value,
+        };
+        const tenant = document.getElementById('tenant').value;
+        if (tenant) headers['X-Tenant-Id'] = tenant;
+        const res = await fetch(document.getElementById('api').value + path, { ...options, headers });
+        const body = await res.json();
+        if (body.code !== 0) throw new Error(body.message);
+        return body.data;
+      }
+      document.getElementById('login').onclick = () => window.electronCollector.openOzonLogin();
+      document.getElementById('start').onclick = async () => {
+        if (timer) return;
+        await api('/collector/heartbeat', {
+          method: 'POST',
+          body: JSON.stringify({
+            agentKey: document.getElementById('agentKey').value,
+            type: 'ELECTRON',
+            name: 'Electron 本机',
+            sessionValid: true,
+          }),
+        });
+        log('心跳成功，开始领任务');
+        timer = setInterval(async () => {
+          try {
+            const item = await api(
+              '/collector/tasks/claim?agentKey=' +
+                encodeURIComponent(document.getElementById('agentKey').value) +
+                '&type=ELECTRON',
+            );
+            if (!item) return;
+            log('领取 ' + item.sourceUrl);
+            let product;
+            if (/ozon.ru\/product\/mock-/i.test(item.sourceUrl)) {
+              const sku = (item.sourceUrl.match(/(\d{6,})/) || ['', Date.now()])[1];
+              product = {
+                skuId: String(sku),
+                name: 'Electron Mock ' + sku,
+                sourceUrl: item.sourceUrl,
+                imageUrls: [],
+                price: 999,
+                currency: 'RUB',
+                stock: 10,
+                specs: [],
+                salesCount: 100,
+              };
+            } else {
+              const parsed = await window.electronCollector.collectUrl(item.sourceUrl);
+              if (parsed.blocked) throw new Error('验证码拦截');
+              product = {
+                skuId: parsed.skuId,
+                name: parsed.name,
+                sourceUrl: parsed.sourceUrl,
+                mainImageUrl: parsed.mainImageUrl,
+                imageUrls: parsed.imageUrls || [],
+                price: Number(parsed.price) || 0,
+                currency: parsed.currency || 'RUB',
+                stock: Number(parsed.stock) || 0,
+                specs: parsed.specs || [],
+                salesCount: Number(parsed.salesCount) || 0,
+              };
+            }
+            await api('/collector/tasks/' + item.id + '/result', {
+              method: 'POST',
+              body: JSON.stringify({
+                agentKey: document.getElementById('agentKey').value,
+                success: true,
+                product,
+              }),
+            });
+            log('回传成功 ' + product.skuId);
+          } catch (error) {
+            log('错误 ' + error.message);
+          }
+        }, 4000);
+      };
+      document.getElementById('stop').onclick = () => {
+        clearInterval(timer);
+        timer = null;
+        log('已停止');
+      };
+    </script>
+  </body>
+</html>

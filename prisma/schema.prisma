@@ -1,0 +1,937 @@
+// =============================================================================
+// 跨境电商多租户管理系统 V1.0 — Prisma Schema
+// 数据库：PostgreSQL
+// 隔离策略：默认共享库 + tenantId 行级强隔离
+// 大租户可升级为独立库：Tenant.isolationMode=DEDICATED + databaseUrlRef
+// 例外：超管 User.tenantId 可空；Role/Permission 为系统级字典
+// 第三方店铺 Token：AES-GCM 密文入库，加密主密钥走环境变量；禁止明文密码
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------- 枚举 -----------------------------
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+/// SHARED：共用库行级隔离；DEDICATED：该租户走独立库（连接串只存引用）
+enum TenantIsolationMode {
+  SHARED
+  DEDICATED
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+/// 三级固定角色：超管 / 租户管理员 / 普通操作员
+enum RoleCode {
+  SUPER_ADMIN
+  TENANT_ADMIN
+  OPERATOR
+}
+
+/// 菜单权限 / 数据权限 / 操作权限
+enum PermissionType {
+  MENU
+  DATA
+  ACTION
+}
+
+enum CollectorType {
+  ELECTRON
+  CHROME_EXT
+}
+
+enum CollectorAgentStatus {
+  ONLINE
+  OFFLINE
+  BUSY
+}
+
+enum CrawlerMode {
+  CATEGORY_TOP
+  CSV_URL
+}
+
+enum CrawlerTaskStatus {
+  PENDING
+  QUEUED
+  RUNNING
+  PAUSED
+  SUCCESS
+  PARTIAL_FAILED
+  FAILED
+  CANCELLED
+}
+
+enum CrawlerItemStatus {
+  PENDING
+  QUEUED
+  RUNNING
+  SUCCESS
+  FAILED
+  RETRYING
+  SKIPPED
+}
+
+enum LogLevel {
+  DEBUG
+  INFO
+  WARN
+  ERROR
+}
+
+enum ProductStatus {
+  CRAWLED
+  AI_PENDING
+  AI_DONE
+  REVIEW_PENDING
+  APPROVED
+  REJECTED
+  ON_SHELF
+  OFF_SHELF
+}
+
+enum WbListingStatus {
+  NONE
+  QUEUED
+  PROCESSING
+  LISTED
+  FAILED
+  UNLISTED
+}
+
+enum AiSelectionStatus {
+  QUEUED
+  RUNNING
+  SUCCESS
+  FAILED
+}
+
+enum ReviewAction {
+  APPROVE
+  REJECT
+  EDIT
+}
+
+enum PlatformCode {
+  OZON
+  WILDBERRIES
+}
+
+enum PlatformAccountStatus {
+  ENABLED
+  DISABLED
+  PLACEHOLDER
+}
+
+enum SalesOrderStatus {
+  CREATED
+  PURCHASE_PENDING
+  PURCHASING
+  IN_TRANSIT_WB
+  ARRIVED_WB
+  INBOUND
+  SHIPPED
+  COMPLETED
+  EXCEPTION
+  CANCELLED
+}
+
+/// 代采订单状态：待采购 → 采购成功/失败 → 已发货至 WB 仓 → 已到达 WB 官方仓
+enum PurchaseOrderStatus {
+  PENDING_PURCHASE
+  PURCHASE_SUCCESS
+  PURCHASE_FAILED
+  SHIPPED_TO_WB
+  ARRIVED_WB
+}
+
+enum LogisticsRelatedType {
+  PURCHASE_ORDER
+  SALES_ORDER
+}
+
+enum AlertLevel {
+  INFO
+  WARNING
+  ERROR
+}
+
+enum AlertStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+enum WarehouseType {
+  WB_OFFICIAL
+  LOCAL_FULFILLMENT
+}
+
+enum FileBizType {
+  CRAWLER_CSV
+  EXPORT
+  OTHER
+}
+
+// ----------------------------- 租户 / 权限 -----------------------------
+
+model Tenant {
+  id        String       @id @default(uuid())
+  name      String
+  code      String       @unique
+  status    TenantStatus @default(ACTIVE)
+  /// V1 全部 SHARED；数据量上去后，单租户可切换 DEDICATED，业务代码走连接工厂即可
+  isolationMode TenantIsolationMode @default(SHARED)
+  /// 指向环境变量或配置中心路径，禁止明文数据库连接串入库
+  databaseUrlRef String?
+  remark    String?
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  configs          TenantConfig[]
+  users            User[]
+  userRoles        UserRole[]
+  userPermissions  UserPermission[]
+  auditLogs        AuditLog[]
+  platformAccounts PlatformAccount[]
+  userShopAccesses UserShopAccess[]
+  productShopListings ProductShopListing[]
+  collectorAgents  CollectorAgent[]
+  crawlerTasks     CrawlerTask[]
+  crawlerItems     CrawlerTaskItem[]
+  crawlerLogs      CrawlerLog[]
+  products         Product[]
+  snapshots        ProductSnapshot[]
+  aiSelections     AiSelection[]
+  reviews          ProductReview[]
+  salesOrders      SalesOrder[]
+  purchaseOrders   PurchaseOrder[]
+  orderLinks       OrderLink[]
+  logisticsTracks  LogisticsTrack[]
+  alerts           OrderAlert[]
+  warehouses       Warehouse[]
+  inbounds         InboundRecord[]
+  outbounds        OutboundRecord[]
+  files            FileObject[]
+
+  @@map("tenants")
+}
+
+/// 租户级配置（代理池、延时策略、默认采集器、AI 厂商等）
+model TenantConfig {
+  id        String   @id @default(uuid())
+  tenantId  String
+  key       String
+  value     Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, key])
+  @@index([tenantId])
+  @@map("tenant_configs")
+}
+
+model User {
+  id           String     @id @default(uuid())
+  /// 超管可为空；其余用户必须归属租户
+  tenantId     String?
+  username     String     @unique
+  passwordHash String
+  email        String?
+  phone        String?
+  realName     String?
+  status       UserStatus @default(ACTIVE)
+  lastLoginAt  DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  userRoles          UserRole[]
+  shopAccesses       UserShopAccess[]
+  moduleAccesses     UserPermission[]
+  auditLogs          AuditLog[]
+  createdTasks       CrawlerTask[]      @relation("CrawlerTaskCreator")
+  reviews            ProductReview[]    @relation("ProductReviewer")
+  createdSalesOrders SalesOrder[]       @relation("SalesOrderCreator")
+  inboundOps         InboundRecord[]    @relation("InboundOperator")
+  outboundOps        OutboundRecord[]   @relation("OutboundOperator")
+  resolvedAlerts     OrderAlert[]       @relation("AlertResolver")
+  uploadedFiles      FileObject[]       @relation("FileUploader")
+
+  @@index([tenantId])
+  @@map("users")
+}
+
+model Role {
+  id        String   @id @default(uuid())
+  code      RoleCode @unique
+  name      String
+  isSystem  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  permissions RolePermission[]
+  users       UserRole[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id        String         @id @default(uuid())
+  code      String         @unique
+  name      String
+  type      PermissionType
+  /// 菜单路径或接口标识，如 /crawler/tasks、crawler:task:retry
+  resource  String
+  parentId  String?
+  sortOrder Int            @default(0)
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  parent     Permission?      @relation("PermissionTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children   Permission[]     @relation("PermissionTree")
+  roles      RolePermission[]
+  userGrants UserPermission[]
+
+  @@index([type])
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  assignedAt   DateTime @default(now())
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+/// 操作员按人分配的模块（存菜单权限码）。超管/租户管理员不依赖本表。
+model UserPermission {
+  userId       String
+  permissionId String
+  tenantId     String
+  assignedAt   DateTime @default(now())
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  @@id([userId, permissionId])
+  @@index([tenantId])
+  @@map("user_permissions")
+}
+
+model UserRole {
+  userId    String
+  roleId    String
+  tenantId  String?
+  assignedAt DateTime @default(now())
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role    @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  @@id([userId, roleId])
+  @@index([tenantId])
+  @@map("user_roles")
+}
+
+model AuditLog {
+  id           String   @id @default(uuid())
+  tenantId     String?
+  userId       String?
+  module       String
+  action       String
+  resourceType String
+  resourceId   String?
+  ip           String?
+  userAgent    String?
+  payload      Json?
+  createdAt    DateTime @default(now())
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, createdAt])
+  @@index([userId, createdAt])
+  @@index([resourceType, resourceId])
+  @@map("audit_logs")
+}
+
+// ----------------------------- 租户店铺 / 平台账号 -----------------------------
+
+/// 租户绑定的平台店铺。API Token 以 AES-GCM 密文入库，接口永不回传明文。
+model PlatformAccount {
+  id              String                 @id @default(uuid())
+  tenantId        String
+  platform        PlatformCode
+  name            String
+  /// 历史字段：仅作迁移兼容，新店铺不再写入环境变量引用
+  credentialRef   String?
+  /// AES-256-GCM 密文（iv:tag:ciphertext），明文 Token 禁止落库
+  encryptedSecret String?
+  extra           Json?
+  status          PlatformAccountStatus  @default(PLACEHOLDER)
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+
+  tenant         Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  purchaseOrders PurchaseOrder[]
+  userAccesses   UserShopAccess[]
+  listings       ProductShopListing[]
+
+  @@unique([tenantId, platform, name])
+  @@index([tenantId, platform])
+  @@map("platform_accounts")
+}
+
+/// 操作员可使用的店铺。租户管理员 / 超管默认拥有本租户全部店铺，不依赖本表。
+model UserShopAccess {
+  userId     String
+  shopId     String
+  tenantId   String
+  assignedAt DateTime @default(now())
+
+  user   User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shop   PlatformAccount @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  tenant Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  @@id([userId, shopId])
+  @@index([tenantId])
+  @@index([shopId])
+  @@map("user_shop_accesses")
+}
+
+/// 商品在某个店铺上的上架状态。同一商品可同时上架到多个店铺。
+model ProductShopListing {
+  id            String          @id @default(uuid())
+  tenantId      String
+  productId     String
+  shopId        String
+  status        WbListingStatus @default(NONE)
+  error         String?
+  wbNmId        BigInt?
+  wbImtId       BigInt?
+  wbVendorCode  String?
+  wbSubjectId   Int?
+  wbSubjectName String?
+  listedAt      DateTime?
+  unlistedAt    DateTime?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  tenant  Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  product Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  shop    PlatformAccount @relation(fields: [shopId], references: [id], onDelete: Restrict)
+
+  @@unique([productId, shopId])
+  @@index([tenantId, shopId])
+  @@index([tenantId, status])
+  @@map("product_shop_listings")
+}
+
+// ----------------------------- 爬虫 -----------------------------
+
+/// Chrome 插件 / Electron 在线采集端；服务端不再做线上爬取
+model CollectorAgent {
+  id              String                @id @default(uuid())
+  tenantId        String
+  type            CollectorType
+  agentKey        String
+  name            String
+  status          CollectorAgentStatus  @default(OFFLINE)
+  version         String?
+  lastHeartbeatAt DateTime?
+  /// 会话是否有效（Electron/插件复用登录态）
+  sessionValid    Boolean               @default(false)
+  meta            Json?
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+
+  tenant     Tenant            @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  tasks      CrawlerTask[]
+  items      CrawlerTaskItem[] @relation("ItemAssignedAgent")
+
+  @@unique([tenantId, agentKey])
+  @@index([tenantId, status])
+  @@map("collector_agents")
+}
+
+model CrawlerTask {
+  id              String             @id @default(uuid())
+  tenantId        String
+  createdById     String
+  name            String
+  mode            CrawlerMode
+  collectorType   CollectorType
+  collectorAgentId String?
+  /// 模式 A：Ozon 品类 ID / 名称 / TOP N
+  categoryId      String?
+  categoryName    String?
+  topN            Int?
+  /// 模式 B：上传的 CSV 文件
+  csvFileId       String?
+  status          CrawlerTaskStatus  @default(PENDING)
+  totalCount      Int                @default(0)
+  successCount    Int                @default(0)
+  failCount       Int                @default(0)
+  /// 代理、延时、重试、无头开关等采集策略
+  config          Json?
+  /// 对应 BullMQ jobId，便于对账与取消
+  bullJobId       String?
+  errorMessage    String?
+  startedAt       DateTime?
+  finishedAt      DateTime?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  tenant         Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  createdBy      User            @relation("CrawlerTaskCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  collectorAgent CollectorAgent? @relation(fields: [collectorAgentId], references: [id], onDelete: SetNull)
+  csvFile        FileObject?     @relation(fields: [csvFileId], references: [id], onDelete: SetNull)
+  items          CrawlerTaskItem[]
+  logs           CrawlerLog[]
+
+  @@index([tenantId, status, createdAt])
+  @@index([tenantId, collectorType])
+  @@map("crawler_tasks")
+}
+
+model CrawlerTaskItem {
+  id               String             @id @default(uuid())
+  tenantId         String
+  taskId           String
+  sourceUrl        String
+  skuId            String?
+  status           CrawlerItemStatus  @default(PENDING)
+  retryCount       Int                @default(0)
+  maxRetry         Int                @default(3)
+  failCode         String?
+  failReason       String?
+  assignedAgentId  String?
+  bullJobId        String?
+  crawledAt        DateTime?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  tenant        Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  task          CrawlerTask     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  assignedAgent CollectorAgent? @relation("ItemAssignedAgent", fields: [assignedAgentId], references: [id], onDelete: SetNull)
+  snapshot      ProductSnapshot?
+  logs          CrawlerLog[]
+
+  @@unique([taskId, sourceUrl])
+  @@index([tenantId, status])
+  @@index([taskId, status])
+  @@map("crawler_task_items")
+}
+
+model CrawlerLog {
+  id        String    @id @default(uuid())
+  tenantId  String
+  taskId    String
+  itemId    String?
+  level     LogLevel  @default(INFO)
+  stage     String
+  message   String
+  extra     Json?
+  createdAt DateTime  @default(now())
+
+  tenant Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  task   CrawlerTask      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  item   CrawlerTaskItem? @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, taskId, createdAt])
+  @@index([itemId])
+  @@map("crawler_logs")
+}
+
+// ----------------------------- 商品 / AI / 复审 -----------------------------
+
+/// 单次采集快照（不可变），与可编辑商品库分离
+model ProductSnapshot {
+  id           String   @id @default(uuid())
+  tenantId     String
+  taskItemId   String   @unique
+  skuId        String
+  name         String
+  sourceUrl    String
+  mainImageUrl String?
+  imageUrls    String[] @default([])
+  price        Decimal  @db.Decimal(12, 2)
+  currency     String   @default("RUB")
+  stock        Int      @default(0)
+  specs        Json
+  categoryPath String?
+  rating       Decimal? @db.Decimal(3, 2)
+  salesCount   Int      @default(0)
+  description  String?  @db.Text
+  brand        String?
+  originalPrice Decimal? @db.Decimal(12, 2)
+  discountPrice Decimal? @db.Decimal(12, 2)
+  reviewCount  Int      @default(0)
+  videoUrls     String[] @default([])
+  variants      Json     @default("[]")
+  skuOptions    Json     @default("[]")
+  rawPayload    Json?
+  createdAt    DateTime @default(now())
+
+  tenant     Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  taskItem   CrawlerTaskItem @relation(fields: [taskItemId], references: [id], onDelete: Cascade)
+  product    Product?
+  aiSelection AiSelection?
+
+  @@index([tenantId, skuId])
+  @@map("product_snapshots")
+}
+
+/// 租户商品库：审核通过后进入，支持上架/下架，按租户隔离
+model Product {
+  id            String        @id @default(uuid())
+  tenantId      String
+  snapshotId    String?       @unique
+  skuId         String
+  name          String
+  sourceUrl     String
+  mainImageUrl  String?
+  imageUrls     String[]      @default([])
+  price         Decimal       @db.Decimal(12, 2)
+  currency      String        @default("RUB")
+  stock         Int           @default(0)
+  specs         Json
+  categoryPath  String?
+  rating        Decimal?      @db.Decimal(3, 2)
+  salesCount    Int           @default(0)
+  description   String?       @db.Text
+  brand         String?
+  originalPrice Decimal?      @db.Decimal(12, 2)
+  discountPrice Decimal?      @db.Decimal(12, 2)
+  reviewCount   Int           @default(0)
+  videoUrls     String[]      @default([])
+  variants      Json          @default("[]")
+  skuOptions    Json          @default("[]")
+  status        ProductStatus @default(CRAWLED)
+  remark        String?
+  onShelfAt     DateTime?
+  offShelfAt    DateTime?
+  wbNmId            BigInt?
+  wbImtId           BigInt?
+  wbVendorCode      String?
+  wbSubjectId       Int?
+  wbSubjectName     String?
+  wbListingStatus   WbListingStatus @default(NONE)
+  wbListingError    String?
+  wbListedAt        DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  tenant       Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  snapshot     ProductSnapshot?     @relation(fields: [snapshotId], references: [id], onDelete: SetNull)
+  aiSelection  AiSelection?
+  reviews      ProductReview[]
+  salesOrders  SalesOrder[]
+  shopListings ProductShopListing[]
+
+  @@unique([tenantId, skuId])
+  @@index([tenantId, status])
+  @@index([tenantId, name])
+  @@map("products")
+}
+
+model AiSelection {
+  id              String            @id @default(uuid())
+  tenantId        String
+  snapshotId      String            @unique
+  productId       String?           @unique
+  status          AiSelectionStatus @default(QUEUED)
+  score           Int?
+  profitEstimate  Decimal?          @db.Decimal(12, 2)
+  profitCurrency  String            @default("RUB")
+  riskPoints      Json?
+  fitReason       String?
+  unfitReason     String?
+  recommended     Boolean?
+  modelProvider   String?
+  modelName       String?
+  promptVersion   String?
+  rawResponse     Json?
+  errorMessage    String?
+  bullJobId       String?
+  finishedAt      DateTime?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  snapshot ProductSnapshot  @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+  product  Product?         @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, status])
+  @@index([tenantId, score])
+  @@map("ai_selections")
+}
+
+model ProductReview {
+  id         String       @id @default(uuid())
+  tenantId   String
+  productId  String
+  reviewerId String
+  action     ReviewAction
+  remark     String?
+  snapshot   Json?
+  createdAt  DateTime     @default(now())
+
+  tenant   Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  product  Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  reviewer User    @relation("ProductReviewer", fields: [reviewerId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, productId, createdAt])
+  @@map("product_reviews")
+}
+
+// ----------------------------- 销售 / 代采订单 -----------------------------
+
+model SalesOrder {
+  id                 String            @id @default(uuid())
+  tenantId           String
+  createdById        String
+  orderNo            String
+  productId          String
+  skuId              String
+  quantity           Int
+  receiverName       String
+  receiverPhone      String
+  receiverCountry    String            @default("RU")
+  receiverRegion     String?
+  receiverCity       String
+  receiverAddress    String
+  receiverPostalCode String?
+  remark             String?
+  status             SalesOrderStatus  @default(CREATED)
+  outboundTrackingNo String?
+  outboundCarrier    String?
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  createdBy     User           @relation("SalesOrderCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  product       Product        @relation(fields: [productId], references: [id], onDelete: Restrict)
+  orderLinks    OrderLink[]
+  inbounds      InboundRecord[]
+  outbounds     OutboundRecord[]
+
+  @@unique([tenantId, orderNo])
+  @@index([tenantId, status, createdAt])
+  @@index([tenantId, skuId])
+  @@map("sales_orders")
+}
+
+model PurchaseOrder {
+  id                String               @id @default(uuid())
+  tenantId          String
+  purchaseNo        String
+  skuId             String
+  quantity          Int
+  /// 一期为模拟单号，后续由 Ozon Adapter 回填
+  ozonOrderNo       String?
+  wbTrackingNo      String?
+  status            PurchaseOrderStatus  @default(PENDING_PURCHASE)
+  failReason        String?
+  platformAccountId String?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  platformAccount PlatformAccount? @relation(fields: [platformAccountId], references: [id], onDelete: SetNull)
+  orderLinks      OrderLink[]
+  inbounds        InboundRecord[]
+
+  @@unique([tenantId, purchaseNo])
+  @@index([tenantId, status])
+  @@index([tenantId, skuId])
+  @@map("purchase_orders")
+}
+
+/// 销售单 ↔ 代采单关联。V1 业务仍一对一（下方两条 UK 保证）；
+/// 升级多对多时只需删除 @@unique([salesOrderId]) 与 @@unique([purchaseOrderId])。
+model OrderLink {
+  id              String   @id @default(uuid())
+  tenantId        String
+  salesOrderId    String
+  purchaseOrderId String
+  skuId           String
+  /// 本条关联占用的数量，拆单/合单时按数量分摊
+  quantity        Int
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant        Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  salesOrder    SalesOrder    @relation(fields: [salesOrderId], references: [id], onDelete: Restrict)
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Restrict)
+  inbounds      InboundRecord[]
+
+  @@unique([salesOrderId])
+  @@unique([purchaseOrderId])
+  @@unique([tenantId, salesOrderId, purchaseOrderId, skuId])
+  @@index([tenantId])
+  @@map("order_links")
+}
+
+model LogisticsTrack {
+  id          String               @id @default(uuid())
+  tenantId    String
+  relatedType LogisticsRelatedType
+  relatedId   String
+  nodeCode    String
+  nodeName    String
+  description String?
+  occurredAt  DateTime
+  rawPayload  Json?
+  createdAt   DateTime             @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, relatedType, relatedId, occurredAt])
+  @@map("logistics_tracks")
+}
+
+model OrderAlert {
+  id          String               @id @default(uuid())
+  tenantId    String
+  relatedType LogisticsRelatedType
+  relatedId   String
+  level       AlertLevel           @default(WARNING)
+  type        String
+  title       String
+  message     String
+  status      AlertStatus          @default(OPEN)
+  resolvedById String?
+  resolvedAt  DateTime?
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+
+  tenant     Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  resolvedBy User?  @relation("AlertResolver", fields: [resolvedById], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, status, createdAt])
+  @@index([tenantId, relatedType, relatedId])
+  @@map("order_alerts")
+}
+
+// ----------------------------- 仓储履约 -----------------------------
+
+model Warehouse {
+  id        String        @id @default(uuid())
+  tenantId  String
+  type      WarehouseType
+  code      String
+  name      String
+  address   String?
+  enabled   Boolean       @default(true)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  tenant    Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  inbounds  InboundRecord[]
+  outbounds OutboundRecord[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId, type])
+  @@map("warehouses")
+}
+
+model InboundRecord {
+  id              String   @id @default(uuid())
+  tenantId        String
+  warehouseId     String
+  /// 履约匹配以关联行为准，销售单/代采单 ID 冗余便于按单查询
+  orderLinkId     String
+  purchaseOrderId String
+  salesOrderId    String
+  inboundNo       String
+  quantity        Int
+  operatorId      String
+  inboundAt       DateTime
+  remark          String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant        Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  warehouse     Warehouse     @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  orderLink     OrderLink     @relation(fields: [orderLinkId], references: [id], onDelete: Restrict)
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Restrict)
+  salesOrder    SalesOrder    @relation(fields: [salesOrderId], references: [id], onDelete: Restrict)
+  operator      User          @relation("InboundOperator", fields: [operatorId], references: [id], onDelete: Restrict)
+  outbounds     OutboundRecord[]
+
+  @@unique([tenantId, inboundNo])
+  @@index([tenantId, orderLinkId])
+  @@index([tenantId, salesOrderId])
+  @@index([tenantId, purchaseOrderId])
+  @@map("inbound_records")
+}
+
+model OutboundRecord {
+  id              String   @id @default(uuid())
+  tenantId        String
+  warehouseId     String
+  inboundRecordId String
+  salesOrderId    String
+  quantity        Int
+  trackingNo      String
+  carrier         String?
+  operatorId      String
+  outboundAt      DateTime
+  remark          String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant        Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  warehouse     Warehouse     @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  inboundRecord InboundRecord @relation(fields: [inboundRecordId], references: [id], onDelete: Restrict)
+  salesOrder    SalesOrder    @relation(fields: [salesOrderId], references: [id], onDelete: Restrict)
+  operator      User          @relation("OutboundOperator", fields: [operatorId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, trackingNo])
+  @@index([tenantId, salesOrderId])
+  @@map("outbound_records")
+}
+
+model FileObject {
+  id           String      @id @default(uuid())
+  tenantId     String
+  bizType      FileBizType
+  originalName String
+  storagePath  String
+  mimeType     String?
+  sizeBytes    Int?
+  uploadedById String
+  createdAt    DateTime    @default(now())
+
+  tenant     Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  uploadedBy User          @relation("FileUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
+  crawlerTasks CrawlerTask[]
+
+  @@index([tenantId, bizType, createdAt])
+  @@map("file_objects")
+}

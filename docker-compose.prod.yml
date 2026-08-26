@@ -1,0 +1,99 @@
+# 生产编排：Postgres + Redis + API + Web(Nginx)
+# 用法：
+#   cp deploy/.env.prod.example .env.prod   # 改密钥与域名
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#
+# 外层建议再用宿主机 Nginx/Caddy 做 HTTPS，反代到本机 8080（或改 WEB_PUBLISH_PORT）
+
+name: aiecom-prod
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aiecom}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-aiecom}
+    volumes:
+      - aiecom_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - aiecom_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - internal
+
+  api:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-aiecom}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-aiecom}?schema=public
+      REDIS_URL: redis://redis:6379
+      PORT: "3000"
+      WEB_ORIGIN: ${WEB_ORIGIN:?set WEB_ORIGIN e.g. https://your.domain}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:?set CREDENTIAL_ENCRYPTION_KEY}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      WB_LOCALE: ${WB_LOCALE:-ru}
+      WB_LISTING_CONCURRENCY: ${WB_LISTING_CONCURRENCY:-4}
+      WB_DEFAULT_SUBJECT_ID: ${WB_DEFAULT_SUBJECT_ID:-}
+      WB_WAREHOUSE_ID: ${WB_WAREHOUSE_ID:-}
+      WB_CONTENT_API_BASE: ${WB_CONTENT_API_BASE:-}
+      WB_PRICES_API_BASE: ${WB_PRICES_API_BASE:-}
+      WB_MARKETPLACE_API_BASE: ${WB_MARKETPLACE_API_BASE:-}
+      RUN_SEED: ${RUN_SEED:-false}
+      SEED_ADMIN_USERNAME: ${SEED_ADMIN_USERNAME:-admin}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}
+      SEED_DEMO_PASSWORD: ${SEED_DEMO_PASSWORD:-}
+    volumes:
+      - aiecom_uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+
+  web:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.web
+    restart: unless-stopped
+    ports:
+      - "${WEB_PUBLISH_PORT:-8080}:80"
+    depends_on:
+      - api
+    networks:
+      - internal
+
+volumes:
+  aiecom_pg_data:
+  aiecom_redis_data:
+  aiecom_uploads:
+
+networks:
+  internal:
+    driver: bridge

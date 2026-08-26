@@ -1,0 +1,1230 @@
+import {
+  parseProductUrlsFromCsv,
+  mergeCollectorConfig,
+  collectFilterMismatch,
+  applyOzonListingFilters,
+  listingHarvestLimit,
+  listingQuotaDeficit,
+  nextListingBackfill,
+  splitListingQueue,
+} from '@aiecom/collector-core';
+import { detectCaptchaOrBlock } from '@aiecom/collector-core';
+import { withRetry, CaptchaDetectedError } from '@aiecom/collector-core';
+import { extractOzonProductFromHtml, buildSkuOptions } from '@aiecom/collector-core';
+import { buildOzonCategoryListingUrl, extractOzonProductUrls, isOzonListingUrl, pickOzonProductUrls } from '@aiecom/collector-core';
+import { alignSkuOptions, combineFamilyListings, fillSkuOptionsFromVariants, inferWeightOption, isSameOzonFamily, keepMainSkuOnly, ozonListingSlugFamily, productFamilyKey } from '@aiecom/shared';
+import { scoreProduct } from '@aiecom/llm-core';
+import { PRODUCT_REVIEW_QUEUE_STATUSES } from '../product/product-status';
+
+describe('parseProductUrlsFromCsv', () => {
+  it('reads url column from header', () => {
+    const csv = 'name,url\nfoo,https://www.ozon.ru/product/1\nbar,https://www.ozon.ru/product/2';
+    expect(parseProductUrlsFromCsv(csv)).toEqual([
+      'https://www.ozon.ru/product/1',
+      'https://www.ozon.ru/product/2',
+    ]);
+  });
+
+  it('treats each line as url when no header', () => {
+    expect(parseProductUrlsFromCsv('https://www.ozon.ru/a\nnot-a-url\nhttps://www.ozon.ru/b')).toEqual([
+      'https://www.ozon.ru/a',
+      'https://www.ozon.ru/b',
+    ]);
+  });
+});
+
+describe('mergeCollectorConfig', () => {
+  it('defaults crawlAllSkus to false', () => {
+    expect(mergeCollectorConfig().crawlAllSkus).toBe(false);
+    expect(mergeCollectorConfig({}).crawlAllSkus).toBe(false);
+    expect(mergeCollectorConfig({ crawlAllSkus: 'true' }).crawlAllSkus).toBe(true);
+    expect(mergeCollectorConfig({ crawlAllSkus: true }).crawlAllSkus).toBe(true);
+  });
+
+  it('parses optional collect filters from numbers or form strings', () => {
+    expect(mergeCollectorConfig({ minRating: '4.5', minReviewCount: '10', inStockOnly: 'true' })).toMatchObject({
+      minRating: 4.5,
+      minReviewCount: 10,
+      inStockOnly: true,
+    });
+    expect(mergeCollectorConfig({}).minRating).toBeUndefined();
+    expect(mergeCollectorConfig({}).inStockOnly).toBe(false);
+  });
+});
+
+describe('collectFilterMismatch', () => {
+  const product = { rating: 4.6, reviewCount: 20, salesCount: 80, price: 1200, stock: 5 };
+
+  it('returns null when no filters are set', () => {
+    expect(collectFilterMismatch(product, mergeCollectorConfig())).toBeNull();
+  });
+
+  it('rejects products below the configured rating / reviews / price', () => {
+    expect(collectFilterMismatch(product, mergeCollectorConfig({ minRating: 4.8 }))).toContain('评分');
+    expect(collectFilterMismatch(product, mergeCollectorConfig({ minReviewCount: 50 }))).toContain('评价数');
+    expect(collectFilterMismatch({ ...product, stock: 0 }, mergeCollectorConfig({ inStockOnly: true }))).toContain('库存');
+    expect(collectFilterMismatch(product, mergeCollectorConfig({ minPrice: 100, maxPrice: 2000 }))).toBeNull();
+  });
+});
+
+describe('ozon category listing url', () => {
+  it('uses the numeric catalog id instead of searching chinese keywords', () => {
+    expect(buildOzonCategoryListingUrl({ categoryId: '7511', categoryName: '女式衬衫和衬衫' })).toBe(
+      'https://www.ozon.ru/category/7511/',
+    );
+  });
+
+  it('keeps a pasted ozon category url', () => {
+    expect(
+      buildOzonCategoryListingUrl({
+        categoryName: 'https://www.ozon.ru/category/bluzy-i-rubashki-zhenskie-7511/?from=foo',
+      }),
+    ).toBe('https://www.ozon.ru/category/bluzy-i-rubashki-zhenskie-7511/');
+  });
+
+  it('appends rating and price filters to the listing url for chrome to open', () => {
+    expect(
+      applyOzonListingFilters('https://www.ozon.ru/category/7511/', { minRating: 4.5, minPrice: 500, maxPrice: 8000 }),
+    ).toBe('https://www.ozon.ru/category/7511/?rating=4.5&currency_price=500.000%3B8000.000');
+  });
+
+  it('detects listing pages so chrome can expand them', () => {
+    expect(isOzonListingUrl('https://www.ozon.ru/category/7511/')).toBe(true);
+    expect(isOzonListingUrl('https://www.ozon.ru/product/bluzka-4000001111/')).toBe(false);
+  });
+
+  it('harvests extra listing urls so skipped products can be backfilled to topN', () => {
+    expect(listingHarvestLimit(10)).toBe(30);
+    const urls = Array.from({ length: 20 }, (_, i) => `https://www.ozon.ru/product/item-${1000000000 + i}/`);
+    const split = splitListingQueue(urls, 10);
+    expect(split.immediate).toHaveLength(10);
+    expect(split.pool).toHaveLength(10);
+    expect(listingQuotaDeficit(10, { success: 8, inFlight: 0 })).toBe(2);
+    expect(
+      nextListingBackfill(split.pool, split.immediate, 2),
+    ).toEqual({
+      next: split.pool.slice(0, 2),
+      remaining: split.pool.slice(2),
+    });
+  });
+
+  it('keeps the first unique product urls up to topN', () => {
+    expect(
+      pickOzonProductUrls(
+        [
+          'https://www.ozon.ru/category/7511/',
+          '/product/bluzka-belaya-4000001111/?at=1',
+          'https://www.ozon.ru/product/bluzka-chernaya-4000002222/',
+          '/product/bluzka-belaya-4000001111/',
+        ],
+        10,
+      ),
+    ).toEqual([
+      'https://www.ozon.ru/product/bluzka-belaya-4000001111/',
+      'https://www.ozon.ru/product/bluzka-chernaya-4000002222/',
+    ]);
+  });
+});
+
+describe('extractOzonProductUrls', () => {
+  it('keeps real product paths and skips mock urls', () => {
+    const html =
+      'href="/product/kofe-v-zernah-tasty-coffee-brauni-1-kg-1085845200/" ' +
+      'href="/product/mock-咖啡-834656550/" ' +
+      'href="https://www.ozon.ru/product/other-item-200000111/"';
+    expect(extractOzonProductUrls(html, 10)).toEqual([
+      'https://www.ozon.ru/product/kofe-v-zernah-tasty-coffee-brauni-1-kg-1085845200/',
+      'https://www.ozon.ru/product/other-item-200000111/',
+    ]);
+  });
+});
+
+describe('parseComposerProduct', () => {
+  it('reads seo json-ld product fields', () => {
+    const product = extractOzonProductFromHtml(
+      `<html><head><script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product',
+        sku: '1085845200',
+        name: 'Кофе в зернах Tasty Coffee Брауни 1 кг',
+        image: 'https://cdn.ozon.ru/coffee.jpg',
+        offers: { price: 1290 },
+      })}</script></head><body></body></html>`,
+      'https://www.ozon.ru/product/kofe-v-zernah-tasty-coffee-brauni-1-kg-1085845200/',
+    );
+    expect(product).toMatchObject({
+      skuId: '1085845200',
+      name: 'Кофе в зернах Tasty Coffee Брауни 1 кг',
+      price: 1290,
+      currency: 'RUB',
+    });
+  });
+});
+
+describe('captcha detection', () => {
+  it('detects russian robot challenge', () => {
+    expect(detectCaptchaOrBlock('Пожалуйста подтвердите что вы не робот')).toBe(true);
+  });
+
+  it('passes normal product html', () => {
+    expect(detectCaptchaOrBlock('<h1>Наушники</h1>')).toBe(false);
+  });
+
+  it('does not treat a rendered product page as blocked just because captcha sdk is in html', () => {
+    const html = `
+      <html>
+        <head>
+          <script>window.__ozonCaptcha = { provider: "recaptcha" };</script>
+          <script type="application/ld+json">{"@type":"Product","name":"Кофе в зернах Tasty Coffee Брауни, 1 кг","sku":"1085845200"}</script>
+        </head>
+        <body>
+          <h1>Кофе в зернах Tasty Coffee Брауни, 1 кг</h1>
+          <div data-widget="webPrice">1 290 ₽</div>
+        </body>
+      </html>`;
+    expect(detectCaptchaOrBlock(html)).toBe(false);
+  });
+});
+
+describe('ozon html extract', () => {
+  it('reads images, description and specs from a product page', () => {
+    const html = `
+      <html>
+        <head>
+          <meta property="og:image" content="https://ir.ozone.ru/s3/multimedia-1/wc50/cover.jpg" />
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1085845200',
+            name: 'Кофе в зернах Tasty Coffee Брауни, 1 кг',
+            description: 'Ароматный кофе с нотами брауни.',
+            image: ['https://ir.ozone.ru/s3/multimedia-1/wc1000/1.jpg'],
+            offers: { price: 1290, priceCurrency: 'RUB' },
+            additionalProperty: [{ '@type': 'PropertyValue', name: 'Бренд', value: 'Tasty Coffee' }],
+            aggregateRating: { ratingValue: 4.8 },
+          })}</script>
+        </head>
+        <body>
+          <h1>Кофе в зернах Tasty Coffee Брауни, 1 кг</h1>
+          <img src="https:\\/\\/ir.ozone.ru\\/s3\\/multimedia-1\\/wc1000\\/2.jpg" />
+          <div data-widget="webCharacteristics">
+            <dl><dt>Вес</dt><dd>1 кг</dd></dl>
+          </div>
+        </body>
+      </html>`;
+    const product = extractOzonProductFromHtml(
+      html,
+      'https://www.ozon.ru/product/kofe-v-zernah-tasty-coffee-brauni-1-kg-1085845200/',
+    );
+    expect(product.skuId).toBe('1085845200');
+    expect(product.name).toContain('Tasty Coffee');
+    expect(product.price).toBe(1290);
+    expect(product.description).toContain('брауни');
+    expect(product.imageUrls?.some((url) => url.includes('wc1000'))).toBe(true);
+    expect(product.mainImageUrl).toContain('ir.ozone.ru');
+    expect(product.specs?.some((item) => item.name === 'Бренд' && item.value === 'Tasty Coffee')).toBe(true);
+    expect(product.brand).toBe('Tasty Coffee');
+  });
+
+  it('reads gallery images and variant options from ozon widgetStates', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1085845200',
+            name: 'Кофе в зернах Tasty Coffee Брауни, 1 кг',
+            offers: { price: 2476 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webGallery-1': JSON.stringify({
+                images: [
+                  { src: 'https://ir.ozone.ru/s3/multimedia-1/wc50/a.jpg', original: 'https://ir.ozone.ru/s3/multimedia-1/wc1200/a.jpg' },
+                  { src: 'https://ir.ozone.ru/s3/multimedia-2/wc1200/b.jpg' },
+                  { src: 'https://ir.ozone.ru/s3/multimedia-3/wc1200/c.jpg' },
+                ],
+              }),
+              'webAspects-1': JSON.stringify({
+                aspects: [
+                  {
+                    name: 'Вес товара, г',
+                    values: [
+                      { value: '250', isSelected: false, link: '/product/coffee-250-1111111111/' },
+                      { value: '1000', isSelected: true, sku: '1085845200' },
+                    ],
+                  },
+                  {
+                    name: 'Название вкуса',
+                    values: [
+                      { value: 'Брауни', isSelected: true },
+                      { value: 'Бэрри', isSelected: false, link: '/product/coffee-berry-2222222222/' },
+                    ],
+                  },
+                ],
+              }),
+              'webCharacteristics-1': JSON.stringify({
+                characteristics: [
+                  { title: 'Тип', values: [{ text: 'Кофе в зернах' }] },
+                  { title: 'Степень обжарки', values: [{ text: 'Темная' }] },
+                ],
+              }),
+              'webPrice-1': JSON.stringify({ price: '2476', originalPrice: '3506' }),
+            },
+          })}</script>
+        </head>
+        <body><h1>Кофе в зернах Tasty Coffee Брауни, 1 кг</h1></body>
+      </html>`;
+    const product = extractOzonProductFromHtml(
+      html,
+      'https://www.ozon.ru/product/kofe-v-zernah-tasty-coffee-brauni-1-kg-1085845200/',
+    );
+    expect(product.imageUrls?.length).toBeGreaterThanOrEqual(3);
+    expect(product.variants?.some((item) => item.name.includes('Вес') && item.values.length >= 2)).toBe(true);
+    expect(product.variants?.some((item) => item.values.some((value) => value.value === 'Бэрри'))).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Тип')).toBe(true);
+    expect(product.originalPrice).toBe(3506);
+    expect(product.price).toBe(2476);
+    expect(product.discountPrice).toBe(2476);
+  });
+
+  it('captures package dimensions from characteristics, ozon depth blob and title', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '4115958654',
+            name: 'Коврик для сушки посуды 30x40 см',
+            offers: { price: 390 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webCharacteristics-1': JSON.stringify({
+                characteristicsList: [
+                  { name: 'Длина, мм', values: ['400'] },
+                  { name: 'Ширина, мм', values: ['300'] },
+                  { name: 'Высота, мм', values: ['20'] },
+                  { name: 'Вес товара, г', values: ['450'] },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body><h1>Коврик для сушки посуды 30x40 см</h1></body>
+      </html>`;
+    const product = extractOzonProductFromHtml(
+      html,
+      'https://www.ozon.ru/product/kovrik-dlya-sushki-posudy-30x40-sm-4115958654/',
+    );
+    expect(product.specs?.some((item) => item.name === 'Длина, мм' && item.value === '400')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '450')).toBe(true);
+
+    const titleOnly = extractOzonProductFromHtml(
+      `<html><head><script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product',
+        sku: '3400831917',
+        name: 'Ситечко для заварки 8x8x12 см',
+        offers: { price: 190 },
+      })}</script></head><body><h1>Ситечко для заварки 8x8x12 см</h1></body></html>`,
+      'https://www.ozon.ru/product/sitechko-3400831917/',
+    );
+    expect(titleOnly.specs?.some((item) => /габарит|размер/i.test(item.name) && /8/.test(item.value))).toBe(true);
+
+    const fromBlob = extractOzonProductFromHtml(
+      `<html><head><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webPdp-1': JSON.stringify({
+            sku: '555',
+            name: 'Box',
+            depth: 250,
+            width: 180,
+            height: 60,
+            weight: 800,
+          }),
+        },
+      })}</script></head><body><h1>Box</h1></body></html>`,
+      'https://www.ozon.ru/product/box-555555/',
+    );
+    expect(fromBlob.specs?.some((item) => item.name === 'Длина, мм' && item.value === '250')).toBe(true);
+    expect(fromBlob.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '800')).toBe(true);
+  });
+
+  it('collects original, discount and card prices plus JSON-LD brand', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1085845200',
+            name: 'Coffee',
+            brand: { '@type': 'Brand', name: 'Tasty Coffee' },
+            offers: { price: 2476 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webPrice-1': JSON.stringify({
+                originalPrice: '3506',
+                price: '2690',
+                cardPrice: '2476',
+                marketingPrice: '2690',
+              }),
+            },
+          })}</script>
+        </head>
+        <body><h1>Coffee</h1></body>
+      </html>`;
+    const product = extractOzonProductFromHtml(html, 'https://www.ozon.ru/product/coffee-1085845200/');
+    expect(product.brand).toBe('Tasty Coffee');
+    expect(product.originalPrice).toBe(3506);
+    expect(product.discountPrice).toBe(2690);
+    expect(product.price).toBe(2476);
+  });
+
+  it('keeps gallery photos and drops merchant icons', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1085845200',
+            name: 'Coffee',
+            image: ['https://ir.ozone.ru/s3/multimedia-1/wc1000/product.jpg'],
+            offers: { price: 2476 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webGallery-1': JSON.stringify({
+                images: [
+                  { src: 'https://ir.ozone.ru/s3/multimedia-1/wc1200/bag.jpg' },
+                  { src: 'https://ir.ozone.ru/s3/multimedia-2/wc1200/beans.jpg' },
+                ],
+              }),
+              'webBrand-1': JSON.stringify({
+                logo: 'https://ir.ozone.ru/s3/cms/logo-tasty-coffee.png',
+                src: 'https://cdn1.ozon.ru/graphics/brand-icon.svg',
+              }),
+            },
+          })}</script>
+        </head>
+        <body>
+          <img src="https://cdn1.ozon.ru/graphics/payment-card.png" />
+          <img src="https://ir.ozone.ru/s3/cms/icons/flame-badge.png" />
+          <h1>Coffee</h1>
+        </body>
+      </html>`;
+    const product = extractOzonProductFromHtml(html, 'https://www.ozon.ru/product/coffee-1085845200/');
+    expect(product.imageUrls?.some((url) => /bag|beans|product/i.test(url))).toBe(true);
+    expect(product.imageUrls?.some((url) => /logo|icon|graphics|cms|payment|flame/i.test(url))).toBe(false);
+  });
+
+  it('drops tiny badge-sized gallery images', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1085845200',
+            name: 'Coffee',
+            offers: { price: 2476 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webGallery-1': JSON.stringify({
+                images: [
+                  { src: 'https://ir.ozone.ru/s3/multimedia-1/wc1200/bag.jpg', width: 1200, height: 1200 },
+                  { src: 'https://ir.ozone.ru/s3/multimedia-9/wc1200/badge-tiny.jpg', width: 64, height: 64, type: 'icon' },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body><h1>Coffee</h1></body>
+      </html>`;
+    const product = extractOzonProductFromHtml(html, 'https://www.ozon.ru/product/coffee-1085845200/');
+    expect(product.imageUrls?.some((url) => /bag/i.test(url))).toBe(true);
+    expect(product.imageUrls?.some((url) => /badge-tiny/i.test(url))).toBe(false);
+  });
+
+  it('reads standalone aspect widget without wrapping aspects array', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1085845200',
+            name: 'Кофе Брауни 1 кг',
+            offers: { price: 2476 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webAspects-1': JSON.stringify({
+                data: { title: 'Вес товара, г' },
+                variants: [
+                  { data: { text: '250' }, link: '/product/coffee-250-1111111111/' },
+                  { data: { text: '1000' }, active: true, sku: 1085845200 },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body><h1>Кофе Брауни 1 кг</h1></body>
+      </html>`;
+    const product = extractOzonProductFromHtml(html, 'https://www.ozon.ru/product/coffee-1085845200/');
+    const weight = product.variants?.find((item) => item.name.includes('Вес'));
+    expect(weight?.values.map((item) => item.value)).toEqual(expect.arrayContaining(['250', '1000']));
+    expect(product.skuOptions?.some((item) => item.skuId === '1111111111')).toBe(true);
+  });
+
+  it('reads ozon nested aspect data and flattens sibling skus', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1085845200',
+            name: 'Кофе Брауни 1 кг',
+            offers: { price: 2476 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webAspects-329087-default-1': JSON.stringify({
+                aspects: [
+                  {
+                    data: { title: 'Вес товара, г' },
+                    variants: [
+                      { data: { text: '250' }, active: false, link: '/product/coffee-250-1111111111/' },
+                      { data: { text: '1000' }, active: true, sku: 1085845200 },
+                    ],
+                  },
+                  {
+                    title: 'Название вкуса',
+                    options: [
+                      { searchableText: 'Брауни', selected: true, skuId: '1085845200' },
+                      { searchableText: 'Бэрри', selected: false, href: '/product/coffee-berry-2222222222/' },
+                      { searchableText: 'Кэнди', selected: false, url: '/product/coffee-candy-3333333333/' },
+                    ],
+                  },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body>
+          <div data-widget="webAspects">
+            <p>Вес товара, г</p>
+            <a href="/product/coffee-250-1111111111/">250</a>
+            <div>1000</div>
+          </div>
+          <h1>Кофе Брауни 1 кг</h1>
+        </body>
+      </html>`;
+    const product = extractOzonProductFromHtml(html, 'https://www.ozon.ru/product/coffee-1085845200/');
+    const weight = product.variants?.find((item) => item.name.includes('Вес'));
+    const flavor = product.variants?.find((item) => item.name.includes('вкуса'));
+    expect(weight?.values.map((item) => item.value)).toEqual(expect.arrayContaining(['250', '1000']));
+    expect(flavor?.values.map((item) => item.value)).toEqual(expect.arrayContaining(['Брауни', 'Бэрри', 'Кэнди']));
+    const options = buildSkuOptions({
+      ...product,
+      skuId: product.skuId || '1085845200',
+      name: product.name || 'coffee',
+      sourceUrl: product.sourceUrl || 'https://www.ozon.ru/product/coffee-1085845200/',
+      imageUrls: product.imageUrls || [],
+      price: product.price || 2476,
+      currency: 'RUB',
+      stock: 1,
+      specs: product.specs || [],
+      salesCount: 0,
+    });
+    expect(options.some((item) => item.skuId === '1111111111' || item.sourceUrl?.includes('1111111111'))).toBe(true);
+    expect(options.some((item) => item.skuId === '1085845200')).toBe(true);
+  });
+
+  it('reads sibling sku from product path instead of from_sku query', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1087433228',
+            name: 'Кофе Брауни 250 г',
+            offers: { price: 673 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webAspects-1': JSON.stringify({
+                aspects: [
+                  {
+                    title: 'Название вкуса',
+                    options: [
+                      { searchableText: 'Брауни', selected: true, skuId: '1087433228' },
+                      {
+                        searchableText: 'Кэнди',
+                        href: '/product/kofe-v-zernah-tasty-coffee-kendi-250-g-643792962/?from_sku=3004517624',
+                      },
+                    ],
+                  },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body><h1>Кофе Брауни 250 г</h1></body>
+      </html>`;
+    const product = extractOzonProductFromHtml(html, 'https://www.ozon.ru/product/coffee-1087433228/');
+    const candy = product.variants
+      ?.find((item) => item.name.includes('вкуса'))
+      ?.values.find((item) => item.value === 'Кэнди');
+    expect(candy?.skuId).toBe('643792962');
+    expect(product.skuOptions?.some((item) => item.skuId === '643792962')).toBe(true);
+    expect(product.skuOptions?.every((item) => item.skuId !== '3004517624')).toBe(true);
+  });
+
+  it('keeps weight chips even when ozon appends unit price', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1087433228',
+            name: 'Кофе Брауни 250 г',
+            offers: { price: 673 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webAspects-1': JSON.stringify({
+                aspects: [
+                  {
+                    data: { title: 'Вес товара, г' },
+                    variants: [
+                      { data: { text: '250 22,49 ¥ / 100 гр' }, active: true, sku: 1087433228 },
+                      { data: { text: '1000 18,76 ¥ / 100 гр' }, link: '/product/coffee-1kg-715106535/' },
+                    ],
+                  },
+                  {
+                    title: 'Название вкуса',
+                    options: [
+                      { searchableText: 'Брауни', selected: true, skuId: '1087433228' },
+                      { searchableText: 'Натти', href: '/product/coffee-natty-714928271/' },
+                    ],
+                  },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body><h1>Кофе Брауни 250 г</h1></body>
+      </html>`;
+    const product = extractOzonProductFromHtml(html, 'https://www.ozon.ru/product/coffee-1087433228/');
+    const weight = product.variants?.find((item) => /вес/i.test(item.name));
+    expect(weight?.values.map((item) => item.value)).toEqual(expect.arrayContaining(['250', '1000']));
+    expect(product.skuOptions?.some((item) => item.skuId === '715106535')).toBe(true);
+    expect(product.skuOptions?.find((item) => item.skuId === '1087433228')?.options['Вес товара, г']).toBe('250');
+  });
+
+  it('keeps 1000g chips when ozon shows Выгода badge and nested link objects', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1087433228',
+            name: 'Кофе в зернах Tasty Coffee Брауни, 250 г',
+            offers: { price: 6777 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webAspects-1': JSON.stringify({
+                aspects: [
+                  {
+                    aspectName: 'Вес товара, г',
+                    aspectValues: [
+                      { value: '250', isSelected: true, sku: 1087433228 },
+                      {
+                        value: 'Выгода 8%',
+                        data: { text: '1000', subtitle: '22,57 ₽ / 100 гр' },
+                        link: { href: '/product/kofe-v-zernah-tasty-coffee-brauni-1-kg-1085845200/' },
+                      },
+                    ],
+                  },
+                  {
+                    title: 'Название вкуса',
+                    options: [
+                      { searchableText: 'Брауни', selected: true, skuId: '1087433228' },
+                      { searchableText: 'Натти', href: '/product/coffee-natty-714928271/' },
+                    ],
+                  },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body>
+          <div data-widget="webAspects">
+            <p>Вес товара, г</p>
+            <a href="/product/coffee-250-1087433228/">250</a>
+            <button>Выгода 8% 1000 22,57 ₽ / 100 гр</button>
+          </div>
+          <h1>Кофе в зернах Tasty Coffee Брауни, 250 г</h1>
+        </body>
+      </html>`;
+    const product = extractOzonProductFromHtml(html, 'https://www.ozon.ru/product/coffee-1087433228/');
+    const weight = product.variants?.find((item) => /вес/i.test(item.name));
+    expect(weight?.values.map((item) => item.value)).toEqual(expect.arrayContaining(['250', '1000']));
+    expect(product.skuOptions?.some((item) => item.skuId === '1085845200')).toBe(true);
+    expect(product.skuOptions?.find((item) => item.skuId === '1085845200')?.options['Вес товара, г']).toBe('1000');
+  });
+
+  it('reads 1000g from ozon rs chips and product path slugs', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1087433228',
+            name: 'Кофе в зернах Tasty Coffee Брауни, 250 г',
+            offers: { price: 6777 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webAspects-1': JSON.stringify({
+                aspects: [
+                  {
+                    data: { title: 'Вес товара, г' },
+                    rs: [
+                      { key: '250', selected: true, sku: 1087433228 },
+                      {
+                        key: '1000',
+                        title: { text: 'Выгода 8%' },
+                        link: { href: '/product/kofe-v-zernah-tasty-coffee-brauni-1-kg-1085845200/' },
+                      },
+                    ],
+                  },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body>
+          <div data-widget="webAspects">
+            <a href="/product/kofe-v-zernah-tasty-coffee-brauni-250-g-1087433228/">250</a>
+            <a href="/product/kofe-v-zernah-tasty-coffee-brauni-1-kg-1085845200/">pack</a>
+          </div>
+        </body>
+      </html>`;
+    const product = extractOzonProductFromHtml(html, 'https://www.ozon.ru/product/coffee-1087433228/');
+    const weight = product.variants?.find((item) => /вес/i.test(item.name));
+    expect(weight?.values.map((item) => item.value)).toEqual(expect.arrayContaining(['250', '1000']));
+    expect(product.skuOptions?.some((item) => item.skuId === '1085845200')).toBe(true);
+  });
+
+  it('does not treat recommendation carousels as weight or flavor variants', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1087433228',
+            name: 'Кофе в зернах Tasty Coffee Брауни, 250 г',
+            offers: { price: 6777 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webAspects-1': JSON.stringify({
+                aspects: [
+                  {
+                    name: 'Вес товара, г',
+                    values: [
+                      { value: '250', isSelected: true, sku: 1087433228, link: '/product/kofe-v-zernah-tasty-coffee-brauni-250-g-1087433228/' },
+                      { value: '1000', link: '/product/kofe-v-zernah-tasty-coffee-brauni-1-kg-1085845200/' },
+                    ],
+                  },
+                  {
+                    name: 'Название вкуса',
+                    values: [
+                      { value: 'Брауни', isSelected: true, sku: 1087433228 },
+                      { value: 'Бэрри', link: '/product/kofe-v-zernah-tasty-coffee-berri-250-g-231706603/' },
+                    ],
+                  },
+                ],
+              }),
+              'skuGrid-1': JSON.stringify({
+                title: 'Покупают вместе',
+                values: [
+                  { text: '1 кг', link: '/product/kofe-v-zernah-tasty-coffee-braziliya-serrado-1-kg-555555555/' },
+                  { text: '250', link: '/product/kofe-v-zernah-milky-fusion-250-g-666666666/' },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body>
+          <div data-widget="webAspects">
+            <p>Вес товара, г</p>
+            <a href="/product/kofe-v-zernah-tasty-coffee-brauni-250-g-1087433228/">250</a>
+            <a href="/product/kofe-v-zernah-tasty-coffee-brauni-1-kg-1085845200/">1000</a>
+            <p>Название вкуса</p>
+            <a href="/product/kofe-v-zernah-tasty-coffee-brauni-250-g-1087433228/">Брауни</a>
+            <a href="/product/kofe-v-zernah-tasty-coffee-berri-250-g-231706603/">Бэрри</a>
+          </div>
+          <div data-widget="skuGrid">
+            <a href="/product/kofe-v-zernah-tasty-coffee-braziliya-serrado-1-kg-555555555/">Бразилия 1 кг</a>
+            <a href="/product/drip-kofe-lebo-drip-mix-48-sht-777777777/">drip</a>
+          </div>
+        </body>
+      </html>`;
+    const product = extractOzonProductFromHtml(
+      html,
+      'https://www.ozon.ru/product/kofe-v-zernah-tasty-coffee-brauni-250-g-1087433228/',
+    );
+    expect(product.skuOptions?.some((item) => item.skuId === '1085845200')).toBe(true);
+    expect(product.skuOptions?.some((item) => item.skuId === '231706603')).toBe(true);
+    expect(product.skuOptions?.every((item) => item.skuId !== '555555555')).toBe(true);
+    expect(product.skuOptions?.every((item) => item.skuId !== '666666666')).toBe(true);
+    expect(product.skuOptions?.every((item) => item.skuId !== '777777777')).toBe(true);
+  });
+
+  it('reads color image swatches without text labels', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '266162238',
+            name: 'Самоклеящийся держатель для швабры 2 ШТ, Белый',
+            offers: { price: 1584 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webAspects-1': JSON.stringify({
+                aspects: [
+                  {
+                    name: 'Цвет: белый',
+                    values: [
+                      {
+                        ariaLabel: 'Белый',
+                        image: 'https://ir.ozone.ru/s3/multimedia-1/wc50/white.jpg',
+                        isSelected: true,
+                        sku: 266162238,
+                      },
+                      {
+                        alt: 'Серый',
+                        preview: 'https://ir.ozone.ru/s3/multimedia-1/wc50/grey.jpg',
+                        href: '/product/samokleyashchiysya-derzhatel-dlya-shvabry-2-sht-seryy-266162239/',
+                      },
+                    ],
+                  },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body>
+          <div data-widget="webAspects">
+            <p>Цвет: белый</p>
+            <a href="/product/samokleyashchiysya-derzhatel-dlya-shvabry-2-sht-belyy-266162238/">
+              <img src="https://ir.ozone.ru/s3/multimedia-1/wc50/white.jpg" alt="Белый" />
+            </a>
+            <a href="/product/samokleyashchiysya-derzhatel-dlya-shvabry-2-sht-seryy-266162239/">
+              <img src="https://ir.ozone.ru/s3/multimedia-1/wc50/grey.jpg" alt="Серый" />
+            </a>
+          </div>
+          <h1>Самоклеящийся держатель для швабры 2 ШТ, Белый</h1>
+        </body>
+      </html>`;
+    const product = extractOzonProductFromHtml(
+      html,
+      'https://www.ozon.ru/product/samokleyashchiysya-derzhatel-dlya-shvabry-2-sht-belyy-266162238/',
+    );
+    const color = product.variants?.find((item) => /цвет/i.test(item.name));
+    expect(color?.values.map((item) => item.value)).toEqual(expect.arrayContaining(['Белый', 'Серый']));
+    expect(color?.values.some((item) => item.imageUrls?.some((url) => url.includes('white.jpg')))).toBe(true);
+    expect(product.skuOptions?.some((item) => item.skuId === '266162239')).toBe(true);
+  });
+
+  it('reads color image swatches from webAspects html when json is missing', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '266162238',
+            name: 'Самоклеящийся держатель для швабры 2 ШТ, Белый',
+            offers: { price: 1584 },
+          })}</script>
+        </head>
+        <body>
+          <div data-widget="webAspects">
+            <p>Цвет: белый</p>
+            <a href="/product/samokleyashchiysya-derzhatel-dlya-shvabry-2-sht-belyy-266162238/">
+              <img src="https://ir.ozone.ru/s3/multimedia-1/wc50/white.jpg" alt="Белый" />
+            </a>
+            <a href="/product/samokleyashchiysya-derzhatel-dlya-shvabry-2-sht-seryy-266162239/">
+              <img src="https://ir.ozone.ru/s3/multimedia-1/wc50/grey.jpg" alt="Серый" />
+            </a>
+          </div>
+          <h1>Самоклеящийся держатель для швабры 2 ШТ, Белый</h1>
+        </body>
+      </html>`;
+    const product = extractOzonProductFromHtml(
+      html,
+      'https://www.ozon.ru/product/samokleyashchiysya-derzhatel-dlya-shvabry-2-sht-belyy-266162238/',
+    );
+    const color = product.variants?.find((item) => /цвет/i.test(item.name));
+    expect(color?.values.map((item) => item.value)).toEqual(expect.arrayContaining(['Белый', 'Серый']));
+    expect(product.skuOptions?.some((item) => item.skuId === '266162239')).toBe(true);
+  });
+
+  it('reads quantity chips as orderable skus instead of weight', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1901992760',
+            name: 'Крепление для картин / 4 штуки.',
+            offers: { price: 673 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webAspects-1': JSON.stringify({
+                aspects: [
+                  {
+                    name: 'Общее количество, шт',
+                    values: [
+                      { value: '4', isSelected: true, sku: 1901992760 },
+                      { value: '10', link: '/product/kreplenie-dlya-kartin-10-shtuk-2850007823/' },
+                      { value: '12', link: '/product/kreplenie-dlya-kartin-12-shtuk-2850009514/' },
+                    ],
+                  },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body>
+          <div data-widget="webAspects">
+            <p>Общее количество, шт:</p>
+            <button>4</button>
+            <a href="/product/kreplenie-dlya-kartin-10-shtuk-2850007823/">10</a>
+            <a href="/product/kreplenie-dlya-kartin-12-shtuk-2850009514/">12</a>
+          </div>
+          <h1>Крепление для картин / 4 штуки.</h1>
+        </body>
+      </html>`;
+    const product = extractOzonProductFromHtml(
+      html,
+      'https://www.ozon.ru/product/kreplenie-dlya-kartin-podves-dlya-kartin-4-shtuki-1901992760/',
+    );
+    const qty = product.variants?.find((item) => /количест|штук/i.test(item.name));
+    expect(qty?.values.map((item) => item.value)).toEqual(expect.arrayContaining(['4', '10', '12']));
+    expect(product.variants?.some((item) => /вес/i.test(item.name))).toBe(false);
+    expect(product.skuOptions?.map((item) => item.skuId)).toEqual(
+      expect.arrayContaining(['1901992760', '2850007823', '2850009514']),
+    );
+  });
+
+  it('keeps clothing size and color aspects on the same listing', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '4000001111',
+            name: 'Блузка женская белая',
+            offers: { price: 1990 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webAspects-1': JSON.stringify({
+                aspects: [
+                  {
+                    name: 'Цвет',
+                    values: [
+                      { ariaLabel: 'Белый', image: 'https://ir.ozone.ru/s3/multimedia-1/wc50/w.jpg', sku: 4000001111, isSelected: true },
+                      { ariaLabel: 'Чёрный', preview: 'https://ir.ozone.ru/s3/multimedia-1/wc50/b.jpg', href: '/product/bluzka-zhenskaya-chernaya-4000002222/' },
+                    ],
+                  },
+                  {
+                    name: 'Размер',
+                    values: [
+                      { value: 'S', sku: 4000001111, isSelected: true },
+                      { value: 'M', link: '/product/bluzka-zhenskaya-belaya-m-4000003333/' },
+                    ],
+                  },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body><h1>Блузка женская белая</h1></body>
+      </html>`;
+    const product = extractOzonProductFromHtml(html, 'https://www.ozon.ru/product/bluzka-zhenskaya-belaya-4000001111/');
+    expect(product.variants?.map((item) => item.name)).toEqual(expect.arrayContaining(['Цвет', 'Размер']));
+    expect(product.skuOptions?.map((item) => item.skuId)).toEqual(
+      expect.arrayContaining(['4000001111', '4000002222', '4000003333']),
+    );
+  });
+
+  it('fills orderable skus from chips when ingest only stored the current sku', () => {
+    const filled = fillSkuOptionsFromVariants({
+      skuId: '1901992760',
+      name: 'Крепление для картин / 4 штуки.',
+      sourceUrl: 'https://www.ozon.ru/product/kreplenie-1901992760/',
+      price: 6.73,
+      skuOptions: [
+        {
+          skuId: '1901992760',
+          name: 'Крепление для картин / 4 штуки.',
+          sourceUrl: 'https://www.ozon.ru/product/kreplenie-1901992760/',
+          price: 6.73,
+          imageUrls: [],
+          options: { 'Общее количество, шт': '4' },
+        },
+      ],
+      variants: [
+        {
+          name: 'Общее количество, шт',
+          values: [
+            { value: '4', skuId: '1901992760', selected: true },
+            { value: '10', skuId: '2850007823', sourceUrl: 'https://www.ozon.ru/product/kreplenie-10-shtuk-2850007823/' },
+            { value: '12', skuId: '2850009514', sourceUrl: 'https://www.ozon.ru/product/kreplenie-12-shtuk-2850009514/' },
+          ],
+        },
+      ],
+    });
+    expect(filled.map((item) => item.skuId)).toEqual(expect.arrayContaining(['1901992760', '2850007823', '2850009514']));
+    expect(filled.find((item) => item.skuId === '2850007823')?.options['Общее количество, шт']).toBe('10');
+  });
+
+  it('keeps only the page main sku and strips sibling sku ids', () => {
+    const kept = keepMainSkuOnly({
+      skuId: '1901992760',
+      name: 'Крепление для картин / 4 штуки.',
+      sourceUrl: 'https://www.ozon.ru/product/kreplenie-1901992760/?at=1',
+      price: 6.73,
+      currency: 'RUB',
+      stock: 1,
+      specs: [],
+      salesCount: 0,
+      imageUrls: ['https://ir.ozone.ru/cover.jpg'],
+      skuOptions: [
+        {
+          skuId: '1901992760',
+          name: 'Крепление для картин / 4 штуки.',
+          sourceUrl: 'https://www.ozon.ru/product/kreplenie-1901992760/',
+          price: 6.73,
+          imageUrls: [],
+          options: { 'Общее количество, шт': '4' },
+        },
+        {
+          skuId: '2850007823',
+          name: 'Крепление для картин / 10 штук.',
+          sourceUrl: 'https://www.ozon.ru/product/kreplenie-10-shtuk-2850007823/',
+          price: 8.1,
+          imageUrls: [],
+          options: { 'Общее количество, шт': '10' },
+        },
+      ],
+      variants: [
+        {
+          name: 'Общее количество, шт',
+          values: [
+            { value: '4', skuId: '1901992760', selected: true },
+            { value: '10', skuId: '2850007823', sourceUrl: 'https://www.ozon.ru/product/kreplenie-10-shtuk-2850007823/' },
+            { value: '12', skuId: '2850009514', sourceUrl: 'https://www.ozon.ru/product/kreplenie-12-shtuk-2850009514/' },
+          ],
+        },
+      ],
+    });
+    expect(kept.skuOptions?.map((item) => item.skuId)).toEqual(['1901992760']);
+    expect(kept.skuOptions?.[0]?.sourceUrl).toBe('https://www.ozon.ru/product/kreplenie-1901992760/');
+    expect(kept.variants?.[0]?.values.map((item) => item.skuId)).toEqual(['1901992760', undefined, undefined]);
+    expect(kept.variants?.[0]?.values[1]?.sourceUrl).toBeUndefined();
+  });
+
+  it('maps each sku to its own flavor instead of copying the first chip', () => {
+    const aligned = alignSkuOptions(
+      [
+        {
+          skuId: '714928271',
+          name: 'Кофе в зернах Tasty Coffee Натти, 250 г',
+          sourceUrl: 'https://www.ozon.ru/product/natti-714928271/',
+          price: 62,
+          imageUrls: [],
+          options: { 'Название вкуса': 'Брауни' },
+        },
+        {
+          skuId: '231706603',
+          name: 'Кофе в зернах Tasty Coffee Бэрри, 250 г',
+          sourceUrl: 'https://www.ozon.ru/product/berri-231706603/',
+          price: 65,
+          imageUrls: [],
+          options: { 'Название вкуса': 'Брауни' },
+        },
+      ],
+      [
+        {
+          name: 'Название вкуса',
+          values: [
+            { value: 'Брауни', skuId: '1087433228' },
+            { value: 'Бэрри', skuId: '231706603' },
+            { value: 'Натти', skuId: '714928271' },
+          ],
+        },
+      ],
+    );
+    expect(aligned.find((item) => item.skuId === '714928271')?.options['Название вкуса']).toBe('Натти');
+    expect(aligned.find((item) => item.skuId === '231706603')?.options['Название вкуса']).toBe('Бэрри');
+    expect(aligned.find((item) => item.skuId === '714928271')?.options['Вес товара, г']).toBe('250');
+  });
+});
+
+describe('ozon product family', () => {
+  it('groups 250g and 1kg titles of the same listing', () => {
+    const flavors = {
+      name: 'Название вкуса',
+      values: [{ value: 'Натти' }, { value: 'Брауни' }],
+    };
+    expect(
+      productFamilyKey('Кофе в зернах Tasty Coffee Натти, 250 г', 'Tasty Coffee', [flavors]),
+    ).toBe(productFamilyKey('Кофе в зернах Tasty Coffee Брауни, 1 кг', 'Tasty Coffee', [flavors]));
+    expect(
+      isSameOzonFamily(
+        { skuId: '714928271', name: 'Кофе в зернах Tasty Coffee Натти, 250 г', brand: 'Tasty Coffee' },
+        { skuId: '1085845200', name: 'Кофе в зернах Tasty Coffee Брауни, 1 кг', brand: 'Tasty Coffee' },
+      ),
+    ).toBe(true);
+    expect(inferWeightOption('', 'https://www.ozon.ru/product/kofe-v-zernah-tasty-coffee-brauni-1-kg-1085845200/')).toBe(
+      '1000',
+    );
+    expect(
+      ozonListingSlugFamily('https://www.ozon.ru/product/kofe-v-zernah-tasty-coffee-brauni-250-g-1087433228/'),
+    ).toBe(ozonListingSlugFamily('https://www.ozon.ru/product/kofe-v-zernah-tasty-coffee-berri-250-g-231706603/'));
+    expect(
+      ozonListingSlugFamily('https://www.ozon.ru/product/kofe-v-zernah-tasty-coffee-brauni-1-kg-1085845200/'),
+    ).not.toBe(
+      ozonListingSlugFamily('https://www.ozon.ru/product/kofe-v-zernah-tasty-coffee-braziliya-serrado-1-kg-555555555/'),
+    );
+    const combined = combineFamilyListings([
+      {
+        skuId: '1087433228',
+        name: 'Кофе в зернах Tasty Coffee Брауни, 250 г',
+        sourceUrl: 'https://www.ozon.ru/product/coffee-1087433228/',
+        price: 67,
+        skuOptions: [
+          {
+            skuId: '1087433228',
+            name: 'Кофе в зернах Tasty Coffee Брауни, 250 г',
+            sourceUrl: 'https://www.ozon.ru/product/coffee-1087433228/',
+            price: 67,
+            imageUrls: [],
+            options: { 'Название вкуса': 'Брауни', 'Вес товара, г': '250' },
+          },
+        ],
+      },
+      {
+        skuId: '1085845200',
+        name: 'Кофе в зернах Tasty Coffee Брауни, 1 кг',
+        sourceUrl: 'https://www.ozon.ru/product/coffee-1085845200/',
+        price: 247,
+      },
+    ]);
+    expect(combined.skuOptions.map((item) => item.skuId)).toEqual(expect.arrayContaining(['1087433228', '1085845200']));
+    expect(combined.variants.find((item) => /вес/i.test(item.name))?.values.map((item) => item.value)).toEqual(
+      expect.arrayContaining(['250', '1000']),
+    );
+  });
+});
+
+describe('product review queue', () => {
+  it('keeps chrome-ingested crawled products visible before AI finishes', () => {
+    expect(PRODUCT_REVIEW_QUEUE_STATUSES).toEqual(
+      expect.arrayContaining(['CRAWLED', 'AI_PENDING', 'AI_DONE', 'REVIEW_PENDING']),
+    );
+  });
+});
+
+describe('withRetry', () => {
+  it('retries failed operations until success', async () => {
+    let attempts = 0;
+    const result = await withRetry(
+      async () => {
+        attempts += 1;
+        if (attempts < 3) throw new Error('fail');
+        return 'ok';
+      },
+      { maxRetry: 3, backoffMs: () => 0 },
+    );
+    expect(result).toBe('ok');
+    expect(attempts).toBe(3);
+  });
+
+  it('does not retry captcha errors', async () => {
+    let attempts = 0;
+    await expect(
+      withRetry(
+        async () => {
+          attempts += 1;
+          throw new CaptchaDetectedError();
+        },
+        { maxRetry: 3, backoffMs: () => 0 },
+      ),
+    ).rejects.toBeInstanceOf(CaptchaDetectedError);
+    expect(attempts).toBe(1);
+  });
+});
+
+describe('rule-based AI scoring', () => {
+  it('recommends a healthy product', () => {
+    const result = scoreProduct({
+      skuId: '1',
+      name: 'ok',
+      sourceUrl: 'https://x',
+      imageUrls: [],
+      price: 1200,
+      currency: 'RUB',
+      stock: 20,
+      specs: [],
+      rating: 4.6,
+      salesCount: 800,
+    });
+    expect(result.recommended).toBe(true);
+    expect(result.score).toBeGreaterThanOrEqual(60);
+  });
+
+  it('rejects zero stock', () => {
+    const result = scoreProduct({
+      skuId: '2',
+      name: 'empty',
+      sourceUrl: 'https://x',
+      imageUrls: [],
+      price: 1200,
+      currency: 'RUB',
+      stock: 0,
+      specs: [],
+      rating: 4.8,
+      salesCount: 900,
+    });
+    expect(result.recommended).toBe(false);
+    expect(result.riskPoints.some((item) => item.includes('库存'))).toBe(true);
+  });
+
+  it('parses nested product JSON from the selection prompt', async () => {
+    const { RuleBasedLlmProvider, buildSelectionPrompt } = await import('@aiecom/llm-core');
+    const provider = new RuleBasedLlmProvider();
+    const raw = await provider.completeJson(
+      buildSelectionPrompt({
+        skuId: '800000000',
+        name: 'nested',
+        sourceUrl: 'https://x',
+        imageUrls: [],
+        price: 1200,
+        currency: 'RUB',
+        stock: 20,
+        specs: [{ name: '品牌', value: 'MockBrand' }],
+        rating: 4.6,
+        salesCount: 800,
+      }),
+    );
+    expect(raw).toMatchObject({ recommended: true, profitCurrency: 'RUB' });
+  });
+});

@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1
+
+FROM node:20-bookworm-slim AS build
+WORKDIR /app
+
+RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
+COPY apps/api/package.json ./apps/api/
+COPY apps/web/package.json ./apps/web/
+COPY apps/collector-extension/package.json ./apps/collector-extension/
+COPY apps/collector-electron/package.json ./apps/collector-electron/
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/collector-core/package.json ./packages/collector-core/
+COPY packages/llm-core/package.json ./packages/llm-core/
+COPY packages/platform-core/package.json ./packages/platform-core/
+
+RUN pnpm install --frozen-lockfile --filter @aiecom/web...
+
+COPY packages/shared ./packages/shared
+COPY apps/web ./apps/web
+
+RUN pnpm --filter @aiecom/shared build \
+  && pnpm --filter @aiecom/web build
+
+FROM nginx:1.27-alpine AS runtime
+COPY deploy/nginx/default.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/apps/web/dist /usr/share/nginx/html
+EXPOSE 80

@@ -1,0 +1,16 @@
+-- AlterEnum
+DO $$ BEGIN
+  CREATE TYPE "WbListingStatus" AS ENUM ('NONE', 'QUEUED', 'PROCESSING', 'LISTED', 'FAILED', 'UNLISTED');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
+
+-- AlterTable
+ALTER TABLE "products" ADD COLUMN IF NOT EXISTS "wbNmId" INTEGER;
+ALTER TABLE "products" ADD COLUMN IF NOT EXISTS "wbImtId" INTEGER;
+ALTER TABLE "products" ADD COLUMN IF NOT EXISTS "wbVendorCode" TEXT;
+ALTER TABLE "products" ADD COLUMN IF NOT EXISTS "wbSubjectId" INTEGER;
+ALTER TABLE "products" ADD COLUMN IF NOT EXISTS "wbSubjectName" TEXT;
+ALTER TABLE "products" ADD COLUMN IF NOT EXISTS "wbListingStatus" "WbListingStatus" NOT NULL DEFAULT 'NONE';
+ALTER TABLE "products" ADD COLUMN IF NOT EXISTS "wbListingError" TEXT;
+ALTER TABLE "products" ADD COLUMN IF NOT EXISTS "wbListedAt" TIMESTAMP(3);

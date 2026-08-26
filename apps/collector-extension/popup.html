@@ -1,0 +1,38 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { width: 340px; font-family: sans-serif; padding: 12px; }
+      input, textarea { width: 100%; margin-bottom: 8px; box-sizing: border-box; }
+      textarea { min-height: 64px; font-size: 12px; }
+      button { margin-right: 6px; margin-bottom: 6px; }
+      #log { font-size: 12px; white-space: pre-wrap; max-height: 160px; overflow: auto; }
+      .hint { font-size: 12px; color: #555; }
+      details { font-size: 12px; margin-bottom: 8px; }
+      details > summary { cursor: pointer; margin-bottom: 6px; color: #666; }
+    </style>
+  </head>
+  <body>
+    <h4>AIECOM Chrome 采集</h4>
+    <p class="hint">请先打开 ozon.ru 并完成验证码。日常只需粘贴登录后的 JWT。</p>
+    <textarea id="token" placeholder="粘贴 JWT Token"></textarea>
+    <div id="tenantWrap" hidden>
+      <input id="tenant" placeholder="工作租户 ID（仅超管需要）" />
+    </div>
+    <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:8px;">
+      <input id="crawlAllSkus" type="checkbox" style="width:auto;margin:0;" />
+      采集全部规格 SKU（默认只采当前页主 SKU）
+    </label>
+    <details>
+      <summary>高级：API 地址</summary>
+      <input id="api" placeholder="API，默认 http://localhost:3000/api/v1" />
+    </details>
+    <button id="save">保存</button>
+    <button id="start">开始轮询</button>
+    <button id="stop">停止</button>
+    <button id="manual">采集本页</button>
+    <div id="log"></div>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
