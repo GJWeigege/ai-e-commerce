@@ -8,10 +8,12 @@ import {
   StreamableFile,
   UploadedFile,
   UseInterceptors,
+  BadRequestException,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
-import { extname, join } from 'path';
+import { randomBytes } from 'crypto';
+import { join } from 'path';
 import { mkdirSync } from 'fs';
 import { RequirePermissions, SkipTransform } from '../../common/decorators/auth.decorators';
 import { CurrentTenantId, CurrentUser } from '../../common/decorators/current.decorators';
@@ -21,6 +23,13 @@ import { CreateCategoryTaskDto } from './dto/create-category-task.dto';
 import { CreateUrlTaskDto } from './dto/create-url-task.dto';
 import { collectFiltersFromDto } from './dto/collect-filters.dto';
 import { CrawlerItemQueryDto, CrawlerTaskQueryDto } from './dto/crawler-task-query.dto';
+
+const CSV_MIME = new Set(['text/csv', 'application/csv', 'application/vnd.ms-excel', 'text/plain', 'application/octet-stream']);
+
+function crawlerCsvUploadDir(): string {
+  const root = process.env.UPLOAD_ROOT || join(process.cwd(), '../../uploads');
+  return join(root, 'crawler-csv');
+}
 
 @Controller('crawler/tasks')
 export class CrawlerController {
@@ -42,7 +51,6 @@ export class CrawlerController {
     return this.crawlerService.createCategoryTask(tenantId, user.id, {
       ...dto,
       config: {
-        cookie: dto.cookie,
         proxies: dto.proxy ? dto.proxy.split(',').map((item) => item.trim()).filter(Boolean) : [],
         crawlAllSkus: dto.crawlAllSkus === true,
         ...collectFiltersFromDto(dto),
@@ -61,7 +69,6 @@ export class CrawlerController {
       name: dto.name,
       urls: dto.urls,
       config: {
-        cookie: dto.cookie,
         proxies: dto.proxy ? dto.proxy.split(',').map((item) => item.trim()).filter(Boolean) : [],
         crawlAllSkus: dto.crawlAllSkus === true,
         ...collectFiltersFromDto(dto),
@@ -105,17 +112,19 @@ export class CrawlerController {
     FileInterceptor('file', {
       storage: diskStorage({
         destination: (_req, _file, cb) => {
-          const dir = join(process.cwd(), '../../uploads/crawler-csv');
+          const dir = crawlerCsvUploadDir();
           mkdirSync(dir, { recursive: true });
           cb(null, dir);
         },
-        filename: (_req, file, cb) => {
-          cb(null, `${Date.now()}-${Math.random().toString(16).slice(2)}${extname(file.originalname)}`);
+        filename: (_req, _file, cb) => {
+          cb(null, `${Date.now()}-${randomBytes(8).toString('hex')}.csv`);
         },
       }),
       fileFilter: (_req, file, cb) => {
-        if (!file.originalname.toLowerCase().endsWith('.csv')) {
-          cb(new Error('仅支持 CSV 文件'), false);
+        const nameOk = file.originalname.toLowerCase().endsWith('.csv');
+        const mimeOk = !file.mimetype || CSV_MIME.has(file.mimetype);
+        if (!nameOk || !mimeOk) {
+          cb(new BadRequestException('仅支持 CSV 文件'), false);
           return;
         }
         cb(null, true);
@@ -129,7 +138,6 @@ export class CrawlerController {
     @UploadedFile() file: Express.Multer.File,
     @Body() body: {
       name?: string;
-      cookie?: string;
       proxy?: string;
       crawlAllSkus?: string | boolean;
       minRating?: string;
@@ -141,17 +149,16 @@ export class CrawlerController {
     },
   ) {
     if (!file) {
-      throw new Error('请上传 CSV 文件');
+      throw new BadRequestException('请上传 CSV 文件');
     }
     return this.crawlerService.createCsvTask(tenantId, user.id, {
-      name: body.name || file.originalname,
-      originalName: file.originalname,
+      name: body.name || file.originalname.replace(/[^\w.\-\u4e00-\u9fff]+/g, '_').slice(0, 120),
+      originalName: file.originalname.replace(/[^\w.\-\u4e00-\u9fff]+/g, '_').slice(0, 180),
       storagePath: file.path,
       mimeType: file.mimetype,
       sizeBytes: file.size,
       uploadedById: user.id,
       config: {
-        cookie: body.cookie,
         proxies: body.proxy ? body.proxy.split(',').map((item) => item.trim()).filter(Boolean) : [],
         crawlAllSkus: body.crawlAllSkus === true || body.crawlAllSkus === 'true',
         minRating: body.minRating,

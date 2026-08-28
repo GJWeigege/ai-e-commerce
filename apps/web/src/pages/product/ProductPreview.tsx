@@ -1,5 +1,15 @@
 import { Descriptions, Drawer, Image, Tag, Typography } from 'antd';
 import { Product, productDescription, productSpecs, productVariants } from '../../services/product';
+import { inspectProductPackage } from '../../services/package-dims';
+import { PackageGapBanner, PACKAGE_GAP_STYLE } from './PackageGapNotice';
+
+function isHttpsUrl(src: string) {
+  try {
+    return new URL(src).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
 
 export function ProductPreviewDrawer({
   product,
@@ -9,13 +19,16 @@ export function ProductPreviewDrawer({
   onClose: () => void;
 }) {
   const variants = product ? productVariants(product) : [];
-  const images = product?.imageUrls?.length
+  const images = (product?.imageUrls?.length
     ? product.imageUrls
     : product?.mainImageUrl
       ? [product.mainImageUrl]
-      : [];
+      : []
+  ).filter(isHttpsUrl);
   const specs = product ? productSpecs(product).filter((item) => item.name !== '商品描述') : [];
   const description = product ? productDescription(product) || product.description || '' : '';
+  const packageGaps = product ? inspectProductPackage(product) : null;
+  const dims = packageGaps?.dimensions;
 
   return (
     <Drawer title={product?.name} width={760} open={Boolean(product)} onClose={onClose} destroyOnClose>
@@ -37,6 +50,7 @@ export function ProductPreviewDrawer({
           ) : (
             <Typography.Text type="secondary">暂无图集</Typography.Text>
           )}
+          {packageGaps ? <PackageGapBanner gaps={packageGaps} /> : null}
           <Descriptions size="small" column={2} style={{ marginBottom: 16 }}>
             <Descriptions.Item label="实际销售价">
               {product.price} {product.currency || 'RUB'}
@@ -52,6 +66,22 @@ export function ProductPreviewDrawer({
             <Descriptions.Item label="WB 类目">{product.wbSubjectName || product.wbSubjectId || '-'}</Descriptions.Item>
             <Descriptions.Item label="WB 上架">
               {product.wbListingStatus && product.wbListingStatus !== 'NONE' ? product.wbListingStatus : '-'}
+            </Descriptions.Item>
+            <Descriptions.Item
+              label="包装尺寸"
+              labelStyle={packageGaps?.missingSize ? PACKAGE_GAP_STYLE : undefined}
+              contentStyle={packageGaps?.missingSize ? PACKAGE_GAP_STYLE : undefined}
+            >
+              {dims?.length || dims?.width || dims?.height
+                ? `${dims.length ?? '—'} × ${dims.width ?? '—'} × ${dims.height ?? '—'} cm`
+                : '未采集'}
+            </Descriptions.Item>
+            <Descriptions.Item
+              label="毛重"
+              labelStyle={packageGaps?.missingWeight ? PACKAGE_GAP_STYLE : undefined}
+              contentStyle={packageGaps?.missingWeight ? PACKAGE_GAP_STYLE : undefined}
+            >
+              {dims?.weightBrutto ? `${dims.weightBrutto} kg` : '未采集'}
             </Descriptions.Item>
           </Descriptions>
           {product.shopListings?.length ? (

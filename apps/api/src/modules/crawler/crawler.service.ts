@@ -17,6 +17,9 @@ import {
   applyOzonListingFilters,
   buildOzonCategoryListingUrl,
   isOzonListingUrl,
+  filterOzonCollectUrls,
+  toAllowedCollectUrl,
+  isSafeHttpsUrl,
 } from '@aiecom/collector-core';
 import { CollectorType, CrawlerItemStatus, Prisma } from '@prisma/client';
 import { combineFamilyListings, dedupeVariants, fillSkuOptionsFromVariants, isSameOzonFamily, familySkuIds, keepMainSkuOnly, ProductSkuOption, ProductVariant, StandardProduct } from '@aiecom/shared';
@@ -24,6 +27,7 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { requireTenantId } from '../../common/tenant/tenant-scope';
 import { PageQueryDto, PageResult, normalizePageQuery } from '../../common/dto/page-query.dto';
 import { QUEUE_AI_SELECTION, QUEUE_CRAWLER_PREPARE, QUEUE_CRAWLER_RETRY } from '../../queues/queue.constants';
+import { assertAgentCanWriteItem, sanitizeTaskForClient } from './crawler-security';
 
 const CHROME_COLLECTOR: CollectorType = 'CHROME_EXT';
 
@@ -128,9 +132,9 @@ export class CrawlerService {
 
   async createUrlTask(tenantId: string | null, userId: string, input: CreateUrlTaskInput) {
     const tid = requireTenantId(tenantId);
-    const urls = [...new Set(input.urls.map((item) => item.trim()).filter((item) => /^https?:\/\//i.test(item)))];
+    const urls = filterOzonCollectUrls(input.urls);
     if (urls.length === 0) {
-      throw new BadRequestException('请提供至少一个商品 URL');
+      throw new BadRequestException('请提供至少一个 ozon.ru 商品或品类链接');
     }
     const config = {
       ...mergeCollectorConfig(input.config as Record<string, unknown>),
@@ -164,9 +168,11 @@ export class CrawlerService {
     options?: { crawlAllSkus?: boolean },
   ) {
     const tid = requireTenantId(tenantId);
-    if (!product.skuId || !product.name || !product.sourceUrl) {
-      throw new BadRequestException('商品 skuId / name / sourceUrl 不能为空');
+    const sourceUrl = toAllowedCollectUrl(product.sourceUrl);
+    if (!product.skuId || !product.name || !sourceUrl) {
+      throw new BadRequestException('商品 skuId / name / sourceUrl 不能为空，且必须是 ozon.ru 链接');
     }
+    product.sourceUrl = sourceUrl;
     const task = await this.prisma.crawlerTask.create({
       data: {
         tenantId: tid,
@@ -215,7 +221,7 @@ export class CrawlerService {
       }),
       this.prisma.crawlerTask.count({ where }),
     ]);
-    return { list, total, page, pageSize };
+    return { list: list.map((row) => sanitizeTaskForClient(row)), total, page, pageSize };
   }
 
   async detail(tenantId: string | null, taskId: string) {
@@ -230,7 +236,7 @@ export class CrawlerService {
     if (!task) {
       throw new NotFoundException('采集任务不存在');
     }
-    return task;
+    return sanitizeTaskForClient(task);
   }
 
   async pageItems(
@@ -329,11 +335,11 @@ export class CrawlerService {
     try {
       let urls: string[] = [];
       const configUrls = Array.isArray(rawConfig.urls)
-        ? (rawConfig.urls as unknown[]).map((item) => String(item)).filter((item) => /^https?:\/\//i.test(item))
+        ? filterOzonCollectUrls((rawConfig.urls as unknown[]).map((item) => String(item)))
         : [];
 
       if (configUrls.length > 0) {
-        urls = [...new Set(configUrls)];
+        urls = configUrls;
       } else if (task.mode === 'CATEGORY_TOP') {
         const listingUrl = applyOzonListingFilters(
           buildOzonCategoryListingUrl({
@@ -437,7 +443,12 @@ export class CrawlerService {
     await this.refreshTaskStatus(item.taskId, tenantId);
   }
 
-  async ingestSuccess(itemId: string, tenantId: string, product: StandardProduct) {
+  async ingestSuccess(
+    itemId: string,
+    tenantId: string,
+    product: StandardProduct,
+    options?: { agentKey?: string },
+  ) {
     const item = await this.prisma.crawlerTaskItem.findFirst({
       where: { id: itemId, tenantId },
       include: { task: true },
@@ -445,6 +456,26 @@ export class CrawlerService {
     if (!item) {
       throw new NotFoundException('采集条目不存在');
     }
+    if (options?.agentKey) {
+      const agent = await this.prisma.collectorAgent.findUnique({
+        where: { tenantId_agentKey: { tenantId, agentKey: options.agentKey } },
+      });
+      if (!agent) {
+        throw new BadRequestException('采集端未注册，请先心跳');
+      }
+      assertAgentCanWriteItem(item, agent.id);
+    } else if (item.status !== 'RUNNING') {
+      throw new BadRequestException('当前条目不可回写（未领取或已结束）');
+    }
+
+    const sourceUrl = toAllowedCollectUrl(product.sourceUrl);
+    if (!sourceUrl) {
+      throw new BadRequestException('商品链接必须是 ozon.ru 商品页');
+    }
+    product.sourceUrl = sourceUrl;
+    product.mainImageUrl = product.mainImageUrl && isSafeHttpsUrl(product.mainImageUrl) ? product.mainImageUrl : undefined;
+    product.imageUrls = (product.imageUrls ?? []).filter(isSafeHttpsUrl);
+    product.videoUrls = (product.videoUrls ?? []).filter(isSafeHttpsUrl);
 
     const config = mergeCollectorConfig(item.task.config as Record<string, unknown> | null);
     const mismatch = collectFilterMismatch(product, config);
@@ -507,7 +538,7 @@ export class CrawlerService {
 
     let listing: typeof listingBase & { skuOptions?: Prisma.InputJsonValue } = listingWithSku;
     let wroteSkuOptionsViaClient = true;
-    let snapshot: Awaited<ReturnType<typeof this.prisma.productSnapshot.upsert>>;
+    let snapshot: { id: string };
     try {
       snapshot = await this.prisma.productSnapshot.upsert({
         where: { taskItemId: itemId },
@@ -589,9 +620,18 @@ export class CrawlerService {
     await this.refreshTaskStatus(item.taskId, tenantId);
   }
 
-  async ingestFailure(itemId: string, tenantId: string, error: unknown) {
+  async ingestFailure(itemId: string, tenantId: string, error: unknown, options?: { agentKey?: string }) {
     const item = await this.prisma.crawlerTaskItem.findFirst({ where: { id: itemId, tenantId } });
     if (!item) return;
+    if (options?.agentKey) {
+      const agent = await this.prisma.collectorAgent.findUnique({
+        where: { tenantId_agentKey: { tenantId, agentKey: options.agentKey } },
+      });
+      if (!agent) {
+        throw new BadRequestException('采集端未注册，请先心跳');
+      }
+      assertAgentCanWriteItem(item, agent.id);
+    }
 
     const captcha = error instanceof CaptchaDetectedError;
     const code = captcha ? 'CAPTCHA_DETECTED' : error instanceof CollectFailedError ? error.code : 'COLLECT_FAILED';
@@ -700,6 +740,7 @@ export class CrawlerService {
     if (!item) {
       throw new NotFoundException('采集条目不存在');
     }
+    assertAgentCanWriteItem(item, agent.id);
     if (!isOzonListingUrl(item.sourceUrl)) {
       throw new BadRequestException('当前条目不是品类/搜索页，无法展开商品链接');
     }

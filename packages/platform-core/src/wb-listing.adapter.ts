@@ -314,7 +314,7 @@ export class LiveWbListingAdapter implements IWbListingAdapter {
         title: variant.title,
         description,
         brand,
-        dimensions: variant.dimensions,
+        ...(variant.dimensions ? { dimensions: variant.dimensions } : {}),
         characteristics: variant.characteristics,
         sizes,
       },

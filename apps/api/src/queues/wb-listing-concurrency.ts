@@ -1,50 +1,13 @@
-import { existsSync, readFileSync } from 'fs';
-import { resolve } from 'path';
+import { loadRootEnv } from '../common/security/load-root-env';
 
 export const DEFAULT_WB_LISTING_CONCURRENCY = 4;
 export const MAX_WB_LISTING_CONCURRENCY = 16;
 export const WB_LISTING_SHOP_LOCK_TTL_MS = 15 * 60 * 1000;
 export const WB_LISTING_SHOP_LOCK_RETRY_MS = 5000;
 
-/** @Processor 装饰器早于 ConfigModule，这里补读仓库根 .env 里尚未注入的键 */
-function ensureEnvFromDotfile() {
-  if (process.env.WB_LISTING_CONCURRENCY) {
-    return;
-  }
-  const candidates = [
-    resolve(__dirname, '../../../.env'),
-    resolve(process.cwd(), '../../.env'),
-    resolve(process.cwd(), '.env'),
-  ];
-  for (const file of candidates) {
-    if (!existsSync(file)) {
-      continue;
-    }
-    for (const line of readFileSync(file, 'utf8').split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) {
-        continue;
-      }
-      const eq = trimmed.indexOf('=');
-      if (eq <= 0) {
-        continue;
-      }
-      const key = trimmed.slice(0, eq).trim();
-      if (process.env[key] != null) {
-        continue;
-      }
-      process.env[key] = trimmed
-        .slice(eq + 1)
-        .trim()
-        .replace(/^['"]|['"]$/g, '');
-    }
-    return;
-  }
-}
-
 export function wbListingConcurrencyFromEnv(raw?: string): number {
   if (raw == null) {
-    ensureEnvFromDotfile();
+    loadRootEnv();
     raw = process.env.WB_LISTING_CONCURRENCY;
   }
   const n = Number(raw);

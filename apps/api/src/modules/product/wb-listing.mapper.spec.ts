@@ -130,7 +130,7 @@ describe('wb listing mapper', () => {
       length: 25,
       width: 18,
       height: 10,
-      weightBrutto: 0.45,
+      weightBrutto: 0.55,
     });
   });
 
@@ -146,30 +146,38 @@ describe('wb listing mapper', () => {
       length: 40,
       width: 30,
       height: 2,
-      weightBrutto: 0.5,
+      weightBrutto: 0.55,
     });
   });
 
-  it('reads 30x40 cm from the product title instead of 20x15x10 defaults', () => {
+  it('reads 30x40 cm from the product title instead of filling defaults', () => {
     expect(
       mapWbDimensions([], {
         name: 'Коврик для сушки посуды, 30x40 см, желтый',
       }),
-    ).toMatchObject({
+    ).toEqual({
       length: 40,
       width: 30,
-      height: 10,
     });
   });
 
-  it('parses combined package габариты', () => {
+  it('parses combined package габариты without inventing weight', () => {
     expect(
       mapWbDimensions([{ name: 'Габариты товара', value: '200x150x50 мм' }]),
     ).toEqual({
       length: 20,
       width: 15,
       height: 5,
-      weightBrutto: 0.3,
+    });
+  });
+
+  it('leaves dimensions blank when size and weight are missing', () => {
+    expect(mapWbDimensions([], { name: 'Silk blouse' })).toEqual({});
+  });
+
+  it('keeps explicit brutto without adding packing allowance', () => {
+    expect(mapWbDimensions([{ name: 'Вес брутто, кг', value: '0.45' }])).toEqual({
+      weightBrutto: 0.45,
     });
   });
 
@@ -181,7 +189,7 @@ describe('wb listing mapper', () => {
           { name: 'Vanilla 1000', options: { 'Вес товара, г': '1000', Вкус: 'ваниль' } },
         ],
       }).weightBrutto,
-    ).toBeGreaterThanOrEqual(1);
+    ).toBeGreaterThanOrEqual(1.2);
   });
 
   it('uses a single large size in the title as package length', () => {
@@ -248,6 +256,7 @@ describe('wb listing mapper', () => {
     expect(payload[0].variants[0].description.length).toBeGreaterThanOrEqual(1000);
     expect(payload[0].variants[0].description.length).toBeLessThanOrEqual(1900);
     expect(payload[0].variants[0].brand).toBe('NoName');
+    expect(payload[0].variants[0].dimensions).toBeUndefined();
   });
 
   it('creates one WB size for each flavor/weight SKU, not only the main skuId', () => {

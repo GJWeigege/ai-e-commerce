@@ -1,10 +1,15 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'crypto';
+import { loadRootEnv } from '../security/load-root-env';
 
 const ALGO = 'aes-256-gcm';
 const IV_LENGTH = 12;
 
 function encryptionKey(): Buffer {
-  const raw = process.env.CREDENTIAL_ENCRYPTION_KEY || process.env.JWT_SECRET;
+  let raw = String(process.env.CREDENTIAL_ENCRYPTION_KEY || '').trim();
+  if (!raw) {
+    loadRootEnv();
+    raw = String(process.env.CREDENTIAL_ENCRYPTION_KEY || '').trim();
+  }
   if (!raw) {
     throw new Error('未配置 CREDENTIAL_ENCRYPTION_KEY，无法加解密店铺 Token');
   }
@@ -30,7 +35,15 @@ export function decryptSecret(payload: string): string {
     throw new Error('店铺凭证密文已损坏，请重新保存 Token');
   }
   const [ivHex, tagHex, dataHex] = parts;
-  const decipher = createDecipheriv(ALGO, encryptionKey(), Buffer.from(ivHex, 'hex'));
-  decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
-  return Buffer.concat([decipher.update(Buffer.from(dataHex, 'hex')), decipher.final()]).toString('utf8');
+  try {
+    const decipher = createDecipheriv(ALGO, encryptionKey(), Buffer.from(ivHex, 'hex'));
+    decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+    return Buffer.concat([decipher.update(Buffer.from(dataHex, 'hex')), decipher.final()]).toString('utf8');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/Unsupported state|unable to authenticate data|Invalid authentication tag|bad decrypt/i.test(message)) {
+      throw new Error('店铺凭证无法解密（加密密钥已变更或密文已损坏），请重新保存 Token');
+    }
+    throw error;
+  }
 }

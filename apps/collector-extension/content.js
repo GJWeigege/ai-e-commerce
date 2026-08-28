@@ -47,6 +47,19 @@ function parsePrice(raw) {
   return n >= 10 && n <= 1000000 ? n : 0;
 }
 
+function isOzonMediaHost(raw) {
+  let href = String(raw || '').trim();
+  if (href.indexOf('//') === 0) href = 'https:' + href;
+  try {
+    const host = new URL(href).hostname.toLowerCase();
+    if (/(?:^|\.)(ozone\.ru|ozonusercontent\.com)$/i.test(host)) return true;
+    if (/(?:^|\.)ozonstatic\.[a-z]+$/i.test(host)) return true;
+    return /ozon/i.test(host) && /^(ir(?:-\d+)?|cdn\d*)\./i.test(host);
+  } catch (_e) {
+    return /ozone\.ru|ozonusercontent\.com|ozonstatic\./i.test(raw);
+  }
+}
+
 function normalizeImage(raw) {
   if (!raw) return null;
   let url = String(raw)
@@ -55,17 +68,18 @@ function normalizeImage(raw) {
     .replace(/&amp;/g, '&')
     .trim();
   if (url.startsWith('//')) url = 'https:' + url;
+  if (url.startsWith('/s3/')) url = 'https://ir.ozone.ru' + url;
   if (!/^https?:\/\//i.test(url)) return null;
-  if (!/ozone\.ru|ozonusercontent\.com|cdn\d*\.ozon\.ru/i.test(url)) return null;
+  if (!isOzonMediaHost(url)) return null;
   if (/\.(svg|gif)(\?|$)/i.test(url) || /favicon|sprite|logo|pixel|1x1|avatar/i.test(url)) return null;
-  return url.replace(/\/wc(?:18|28|50|75|100|200|240|400)\//i, '/wc1200/').split('#')[0];
+  return url.replace(/\/(?:wc|wcs)(?:18|28|50|75|100|140|160|180|200|240|250|300|400)\//i, '/wc1200/').split('#')[0];
 }
 
 function isGalleryImage(url) {
   if (!url) return false;
-  if (/\/cms\/|\/graphics\/|\/icons?\/|\/static\/|\/promo\//i.test(url)) return false;
+  if (/\/cms\/|\/graphics\/|\/icons?\/|\/static\/|\/promo\/|\/bonus\/|\/marketing-api\/|\/banners?\//i.test(url)) return false;
   if (/(?:^|[/-])(?:logo|icon|badge|banner|sprite|avatar|favicon|payment|flame)(?:[/-]|\.|$)/i.test(url)) return false;
-  return /\/s3\/multimedia/i.test(url);
+  return /\/s3\/(?:multimedia|rp-photo)/i.test(url) || /\/multimedia(?:-\w+)?\//i.test(url);
 }
 
 function uniqueImages(urls) {
@@ -73,12 +87,12 @@ function uniqueImages(urls) {
   urls.forEach((item) => {
     const url = normalizeImage(item);
     if (!url || !isGalleryImage(url)) return;
-    const key = (url.match(/multimedia[^/]*\/(?:wc\d+\/)?([^/?]+)/i) || [null, url])[1];
-    const rank = /\/wc(?:1200|2000|2500)\//i.test(url)
+    const key = (url.match(/(?:multimedia|rp-photo)[^/]*\/(?:(?:wc|wcs|c)\d+\/)?([^/?#]+)/i) || [null, url])[1];
+    const rank = /\/wc(?:1200|1500|2000|2500)\//i.test(url)
       ? 4
       : /\/wc1000\//i.test(url)
         ? 3
-        : /\/multimedia/i.test(url) && !/\/wc\d+\//i.test(url)
+        : /\/(?:multimedia|rp-photo)/i.test(url) && !/\/(?:wc|wcs|c)\d+\//i.test(url)
           ? 5
           : 1;
     if (!best[key] || rank > best[key].rank) best[key] = { url, rank };
@@ -276,6 +290,54 @@ function walk(node, visit, depth) {
   Object.keys(node).forEach((key) => walk(node[key], visit, depth + 1));
 }
 
+function isRecommendWidgetKey(key) {
+  return /tileGrid|skuGrid|recommend|similar|alsoBuy|boughtTogether|webList|collection|related/i.test(String(key || ''));
+}
+
+function isPdpGalleryWidgetKey(key) {
+  if (isRecommendWidgetKey(key)) return false;
+  const name = String(key || '').split('-')[0];
+  if (/^webGallery/i.test(name)) return true;
+  if (/^(galleryMobile|pdpGallery|webProductGallery|webPhotoGallery|productGallery)$/i.test(name)) return true;
+  return /gallery/i.test(name) && !/tile|grid|list/i.test(name);
+}
+
+function isGalleryShapedWidget(raw, skuId) {
+  if (!raw || typeof raw !== 'object' || raw.tileImage || raw.mainState) return false;
+  if (Array.isArray(raw.items) && raw.items.some((item) => item && (item.tileImage || item.mainState))) return false;
+  const hasList = Array.isArray(raw.images) || Array.isArray(raw.media) || Array.isArray(raw.photos);
+  if (!hasList) return false;
+  if (raw.sku != null && skuId && String(raw.sku) !== String(skuId)) return false;
+  return Boolean(raw.coverImage) || Boolean(raw.sku) || (Array.isArray(raw.images) && raw.images.length >= 2);
+}
+
+function collectGalleryWidgetUrls(raw, urls) {
+  if (!raw || typeof raw !== 'object' || raw.tileImage || raw.mainState) return;
+  if (raw.coverImage) pushImageUrls(urls, raw.coverImage, 0);
+  if (raw.coverImageUrl) pushImageUrls(urls, raw.coverImageUrl, 0);
+  ['images', 'media', 'photos', 'gallery'].forEach((key) => {
+    if (!Array.isArray(raw[key])) return;
+    raw[key].forEach((item) => {
+      if (typeof item === 'string') urls.push(item);
+      else if (item) pushImageUrls(urls, item, 0);
+    });
+  });
+}
+
+function collectGalleryFromTrees(trees, urls, skuId) {
+  trees.forEach((tree) => {
+    const states = tree && tree.widgetStates;
+    if (!states || typeof states !== 'object') return;
+    Object.keys(states).forEach((key) => {
+      if (isRecommendWidgetKey(key)) return;
+      let widget = states[key];
+      if (typeof widget === 'string') widget = parseJson(widget);
+      if (!isPdpGalleryWidgetKey(key) && !isGalleryShapedWidget(widget, skuId)) return;
+      collectGalleryWidgetUrls(widget, urls);
+    });
+  });
+}
+
 function collectTrees(html) {
   const trees = [];
   const marker = html.indexOf('"widgetStates"');
@@ -288,22 +350,69 @@ function collectTrees(html) {
     const parsed = parseJson(node.textContent || '');
     if (parsed) trees.push(parsed);
   });
+  document.querySelectorAll('[data-state]').forEach((node) => {
+    const parsed = parseJson(node.getAttribute('data-state') || '');
+    if (parsed) trees.push(parsed);
+  });
   return trees;
 }
 
+function pushImageUrls(urls, raw, depth) {
+  if (depth > 5 || raw == null) return;
+  if (typeof raw === 'string') {
+    if (raw.indexOf('/s3/') === 0) urls.push('https://ir.ozone.ru' + raw);
+    else if (raw.indexOf('http') === 0 || raw.indexOf('//') === 0) urls.push(raw);
+    return;
+  }
+  if (Array.isArray(raw)) {
+    raw.forEach((item) => pushImageUrls(urls, item, depth + 1));
+    return;
+  }
+  if (typeof raw !== 'object') return;
+  const w = Number(raw.width || raw.w);
+  const h = Number(raw.height || raw.h);
+  if (isFinite(w) && isFinite(h) && Math.max(w, h) > 0 && Math.max(w, h) < 200) return;
+  if (/logo|icon|badge|banner|payment/i.test(String(raw.type || raw.kind || raw.role || ''))) return;
+  ['original', 'src', 'url', 'image', 'coverImage', 'coverImageUrl', 'previewUrl', 'srcBig', 'picture', 'file_name', 'link'].forEach(
+    (key) => {
+      if (raw[key]) pushImageUrls(urls, raw[key], depth + 1);
+    },
+  );
+}
+
+function specLabel(raw) {
+  if (raw == null) return '';
+  if (typeof raw === 'string' || typeof raw === 'number') {
+    const text = String(raw).replace(/\s+/g, ' ').trim();
+    return text === '[object Object]' ? '' : text;
+  }
+  if (Array.isArray(raw)) return raw.map(specLabel).filter(Boolean).join(', ');
+  if (typeof raw !== 'object') return '';
+  return specLabel(
+    raw.text ||
+      raw.content ||
+      raw.textRs ||
+      raw.contentRS ||
+      raw.valueRs ||
+      raw.title ||
+      raw.value ||
+      raw.name ||
+      raw.label ||
+      raw.key ||
+      raw.caption,
+  );
+}
+
 function addSpec(specs, name, value) {
-  const n = String(name || '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  const v = String(value || '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!n || !v || n.length > 80 || v.length > 800 || n === '商品描述') return;
+  const n = specLabel(name);
+  const v = specLabel(value);
+  if (!n || !v || n === '[object Object]' || v === '[object Object]' || n.length > 80 || v.length > 800 || n === '商品描述') return;
   if (specs.some((item) => item.name === n && item.value === v)) return;
   specs.push({ name: n, value: v });
 }
 
-function extract() {
+function extract(payload) {
+  payload = payload || {};
   const jsonLdNodes = [];
   document.querySelectorAll('script[type="application/ld+json"]').forEach((node) => {
     const parsed = parseJson(node.textContent || 'null');
@@ -317,6 +426,11 @@ function extract() {
     .replace(/\\u002[fF]/g, '/')
     .replace(/\\\//g, '/');
   const trees = collectTrees(html);
+  const composerPages = Array.isArray(payload.composerPages) ? payload.composerPages : [];
+  composerPages.forEach((page) => {
+    if (page) trees.push(page);
+  });
+  const extraImageUrls = Array.isArray(payload.extraImageUrls) ? payload.extraImageUrls : [];
 
   const name =
     jsonLd.name ||
@@ -331,7 +445,7 @@ function extract() {
       document.querySelector('meta[itemprop="sku"]').getAttribute('content')) ||
     (location.pathname.match(/(\d{6,})/) || [null, ''])[1];
 
-  const urls = [];
+  const urls = extraImageUrls.slice();
   const videos = [];
   const variantsMap = {};
   const specs = [];
@@ -377,19 +491,6 @@ function extract() {
     walk(
       tree,
       (obj) => {
-        if (Array.isArray(obj.images)) {
-          obj.images.forEach((item) => {
-            if (typeof item === 'string') urls.push(item);
-            else if (item) {
-              const w = Number(item.width || item.w);
-              const h = Number(item.height || item.h);
-              if (Number.isFinite(w) && Number.isFinite(h) && Math.max(w, h) > 0 && Math.max(w, h) < 200) return;
-              if (/logo|icon|badge|banner|payment/i.test(String(item.type || item.kind || item.role || ''))) return;
-              if (item.original) urls.push(item.original);
-              if (item.src) urls.push(item.src);
-            }
-          });
-        }
         if (typeof obj.videoUrl === 'string') videos.push(obj.videoUrl);
         if (Array.isArray(obj.aspects) || Array.isArray(obj.aspectList) || Array.isArray(obj.skuAspects)) {
           (obj.aspects || obj.aspectList || obj.skuAspects).forEach((aspect) => {
@@ -438,16 +539,16 @@ function extract() {
           .concat(obj.attrs || []);
         charRows.forEach((row) => {
           const title = row && (row.title || row.name || row.key);
-          const values = row && (row.values !== undefined ? row.values : row.value);
-          let text = '';
-          if (typeof values === 'string' || typeof values === 'number') text = String(values);
-          else if (Array.isArray(values)) {
-            text = values
-              .map((item) => (typeof item === 'string' || typeof item === 'number' ? String(item) : (item && (item.text || item.value || item.title)) || ''))
-              .filter(Boolean)
-              .join(', ');
-          }
-          addSpec(specs, title, text);
+          const values =
+            row &&
+            (row.values !== undefined
+              ? row.values
+              : row.contentRS !== undefined
+                ? row.contentRS
+                : row.valueRs !== undefined
+                  ? row.valueRs
+                  : row.value);
+          addSpec(specs, title, Array.isArray(values) ? values.map(specLabel).filter(Boolean).join(', ') : values);
         });
         if (!obj.src && !obj.original && obj.depth != null && obj.width != null && obj.height != null) {
           const depth = Number(obj.depth);
@@ -488,11 +589,22 @@ function extract() {
     );
   });
 
-  document.querySelectorAll('[data-widget="webGallery"] img, [data-widget="webGallery"] source').forEach((img) => {
-    urls.push(img.currentSrc || img.src || img.getAttribute('srcset'));
-    if (img.srcset) img.srcset.split(',').forEach((part) => urls.push(part.trim().split(' ')[0]));
-    urls.push(img.getAttribute('data-src'));
-  });
+  collectGalleryFromTrees(trees, urls, sku);
+  document
+    .querySelectorAll(
+      '[data-widget*="webGallery"], [data-widget="galleryMobile"], [data-widget="pdpGallery"], [data-widget="webProductGallery"], [id*="webGallery"], [id*="state-webGallery"]',
+    )
+    .forEach((root) => {
+      collectGalleryWidgetUrls(parseJson(root.getAttribute('data-state') || ''), urls);
+      root.querySelectorAll('img, source').forEach((img) => {
+        urls.push(img.currentSrc || img.src || '');
+        ['src', 'data-src', 'data-original', 'data-lazy', 'data-zoom-src', 'data-srcset', 'srcset'].forEach((attr) => {
+          const raw = img.getAttribute && img.getAttribute(attr);
+          if (!raw) return;
+          raw.split(',').forEach((part) => urls.push(part.trim().split(' ')[0]));
+        });
+      });
+    });
   const og = document.querySelector('meta[property="og:image"]');
   if (og) urls.push(og.content);
   if (jsonLd.image) {
@@ -600,11 +712,12 @@ function extract() {
   const offer = Array.isArray(offers) ? offers[0] : offers;
   const priceNode = document.querySelector('[data-widget="webPrice"], [data-widget="webSale"]');
   const price = parsePrice((offer && offer.price) || treePrice || (priceNode && priceNode.textContent)) || treePrice;
-  const imageUrls = uniqueImages(urls);
-  const trimmedName = String(name || '').trim();
   const variants = Object.keys(variantsMap)
     .map((key) => variantsMap[key])
-    .filter((item) => isSpecAspectName(item.name) && item.values.length >= 2)
+    .filter((item) => isSpecAspectName(item.name) && item.values.length >= 2);
+  const imageUrls = uniqueImages(urls);
+  const trimmedName = String(name || '').trim();
+  const alignedVariants = variants
     .map((item) => {
       const current =
         item.values.find((value) => value.skuId && value.skuId === String(sku)) ||
@@ -637,7 +750,7 @@ function extract() {
     currency: (offer && offer.priceCurrency) || 'RUB',
     stock: price > 0 ? 1 : 0,
     specs,
-    variants,
+    variants: alignedVariants,
     categoryPath: crumbs.length ? crumbs.join(' / ') : undefined,
     brand: brand || (specs.find((item) => /бренд|brand|торговая марка/i.test(item.name)) || {}).value,
     description: description || undefined,
@@ -647,9 +760,43 @@ function extract() {
   };
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type === 'EXTRACT') {
-    sendResponse(isListingLocation() ? extractListing(message.limit || 80) : extract());
+async function fetchComposerPages() {
+  const path = (location.pathname || '/').replace(/\/?$/, '/');
+  const origin = location.origin || 'https://www.ozon.ru';
+  const api = origin + '/api/composer-api.bx/page/json/v2?url=';
+  const urls = [
+    api + encodeURIComponent(path),
+    api + encodeURIComponent(path + '?layout_container=pdpPage2column&layout_page_index=2'),
+  ];
+  const pages = [];
+  for (let i = 0; i < urls.length; i += 1) {
+    try {
+      const res = await fetch(urls[i], { credentials: 'include', headers: { accept: 'application/json' } });
+      if (!res.ok) continue;
+      const json = await res.json();
+      if (json) pages.push(json);
+    } catch (_e) {
+      /* isolated-world fetch is blocked by CORS on some Chrome versions */
+    }
   }
+  return pages;
+}
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type !== 'EXTRACT') return false;
+  const run = async () => {
+    if (isListingLocation()) return extractListing(message.limit || 80);
+    const payload = {
+      composerPages: Array.isArray(message.composerPages) ? message.composerPages : [],
+      extraImageUrls: Array.isArray(message.extraImageUrls) ? message.extraImageUrls : [],
+    };
+    if (!payload.composerPages.length) {
+      payload.composerPages = await fetchComposerPages();
+    }
+    return extract(payload);
+  };
+  run()
+    .then(sendResponse)
+    .catch((err) => sendResponse({ blocked: true, error: String(err && err.message) }));
   return true;
 });

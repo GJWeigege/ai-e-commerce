@@ -157,7 +157,10 @@ export default function CrawlerTaskPage() {
                 message.error('请填写品类 ID、品类链接或品类名称');
                 return false;
               }
-              await createCategoryTask(values as Parameters<typeof createCategoryTask>[0]);
+              await createCategoryTask({
+                ...(values as Parameters<typeof createCategoryTask>[0]),
+                crawlAllSkus: false,
+              });
               message.success('任务已入队。请在 Chrome 插件点「开始轮询」，插件会打开品类页拆商品链接。');
               actionRef.current?.reload();
               return true;
@@ -179,12 +182,6 @@ export default function CrawlerTaskPage() {
               initialValue={5}
               extra="达标商品数量。品类页会多拆候选链接，未达评分/销量等条件时自动补齐。"
             />
-            <ProFormSwitch
-              name="crawlAllSkus"
-              label="采集全部规格 SKU"
-              extra="默认关闭：只保留当前页主 SKU，不跟进每个规格链接。打开后才会把重量/口味等规格全部采进来。"
-              initialValue={false}
-            />
             <CollectFilterFields />
           </ModalForm>,
           <ModalForm
@@ -203,7 +200,7 @@ export default function CrawlerTaskPage() {
               await createUrlTask({
                 name: values.name,
                 urls,
-                crawlAllSkus: Boolean(values.crawlAllSkus),
+                crawlAllSkus: false,
                 minRating: values.minRating,
                 minReviewCount: values.minReviewCount,
                 minSalesCount: values.minSalesCount,
@@ -223,12 +220,6 @@ export default function CrawlerTaskPage() {
               placeholder="每行一个 https://www.ozon.ru/product/..."
               rules={[{ required: true }]}
             />
-            <ProFormSwitch
-              name="crawlAllSkus"
-              label="采集全部规格 SKU"
-              extra="默认关闭：只采主 SKU，不打开每个规格页。"
-              initialValue={false}
-            />
             <CollectFilterFields />
           </ModalForm>,
           <ModalForm
@@ -238,7 +229,7 @@ export default function CrawlerTaskPage() {
             onFinish={async (values) => {
               const form = new FormData();
               form.append('name', values.name);
-              form.append('crawlAllSkus', values.crawlAllSkus ? 'true' : 'false');
+              form.append('crawlAllSkus', 'false');
               appendFilterFields(form, values);
               const file = values.file?.[0]?.originFileObj as File | undefined;
               if (!file) {
@@ -253,12 +244,6 @@ export default function CrawlerTaskPage() {
             }}
           >
             <ProFormText name="name" label="任务名称" rules={[{ required: true }]} />
-            <ProFormSwitch
-              name="crawlAllSkus"
-              label="采集全部规格 SKU"
-              extra="默认关闭：只采主 SKU。"
-              initialValue={false}
-            />
             <CollectFilterFields />
             <ProFormUploadButton name="file" label="CSV 文件" max={1} fieldProps={{ beforeUpload: () => false, accept: '.csv' }} />
           </ModalForm>,

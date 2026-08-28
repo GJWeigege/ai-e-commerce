@@ -1,8 +1,9 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_GUARD, APP_INTERCEPTOR, APP_FILTER } from '@nestjs/core';
-import { join } from 'path';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { PrismaModule } from './common/prisma/prisma.module';
+import { loadRootEnv, resolveEnvFilePaths } from './common/security/load-root-env';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { TenantGuard } from './common/guards/tenant.guard';
 import { PermissionsGuard } from './common/guards/permissions.guard';
@@ -18,11 +19,16 @@ import { QueueModule } from './queues/queue.module';
 import { HealthController } from './health.controller';
 import { DashboardController } from './dashboard.controller';
 
+loadRootEnv();
+
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      envFilePath: [join(__dirname, '../../../.env'), join(process.cwd(), '../../.env'), '.env'],
+      envFilePath: [...resolveEnvFilePaths(), '.env'],
+    }),
+    ThrottlerModule.forRoot({
+      throttlers: [{ name: 'default', ttl: 60_000, limit: 180 }],
     }),
     PrismaModule,
     AuthModule,
@@ -35,6 +41,7 @@ import { DashboardController } from './dashboard.controller';
   ],
   controllers: [HealthController, DashboardController],
   providers: [
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
     { provide: APP_GUARD, useClass: JwtAuthGuard },
     { provide: APP_GUARD, useClass: TenantGuard },
     { provide: APP_GUARD, useClass: PermissionsGuard },

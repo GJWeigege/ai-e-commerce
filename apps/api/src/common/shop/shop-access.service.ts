@@ -152,7 +152,12 @@ export class ShopAccessService {
     if (!shop.encryptedSecret) {
       throw new BadRequestException(`店铺「${shop.name}」尚未配置 API Token`);
     }
-    return decryptSecret(shop.encryptedSecret);
+    try {
+      return decryptSecret(shop.encryptedSecret);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new BadRequestException(`店铺「${shop.name}」${message}`);
+    }
   }
 
   private assertShopConstraints(

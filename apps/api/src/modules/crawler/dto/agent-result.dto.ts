@@ -143,6 +143,10 @@ export class AgentResultDto {
   error?: string;
 
   @IsOptional()
+  @IsString()
+  failCode?: string;
+
+  @IsOptional()
   @ValidateNested()
   @Type(() => AgentProductDto)
   product?: AgentProductDto;

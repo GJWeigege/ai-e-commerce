@@ -35,6 +35,9 @@ export const DEFAULT_COLLECTOR_CONFIG: CollectorConfig = {
   crawlAllSkus: false,
 };
 
+/** 暂时关闭批量跟进全部规格 SKU，只保留当前页主 skuId。改回 true 即可恢复入口与写入逻辑。 */
+export const CRAWL_ALL_SKUS_ENABLED = false;
+
 export type CollectContext = {
   tenantId: string;
   taskId: string;
@@ -79,7 +82,8 @@ export function mergeCollectorConfig(raw?: Record<string, unknown> | null): Coll
     ...DEFAULT_COLLECTOR_CONFIG,
     ...(raw ?? {}),
     proxies: Array.isArray(raw?.proxies) ? (raw?.proxies as string[]) : DEFAULT_COLLECTOR_CONFIG.proxies,
-    crawlAllSkus: raw?.crawlAllSkus === true || raw?.crawlAllSkus === 'true',
+    crawlAllSkus:
+      CRAWL_ALL_SKUS_ENABLED && (raw?.crawlAllSkus === true || raw?.crawlAllSkus === 'true'),
     minRating: optionalBoundNumber(raw?.minRating, 0, 5),
     minReviewCount: optionalBoundNumber(raw?.minReviewCount, 0, 1_000_000, true),
     minSalesCount: optionalBoundNumber(raw?.minSalesCount, 0, 100_000_000, true),

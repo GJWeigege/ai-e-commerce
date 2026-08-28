@@ -60,6 +60,12 @@ export class WarehouseService {
     if (dto.quantity <= 0 || dto.quantity > purchase.quantity) {
       throw new BadRequestException('入库数量不合法');
     }
+    const duplicated = await this.prisma.inboundRecord.findFirst({
+      where: { tenantId: tid, purchaseOrderId: purchase.id },
+    });
+    if (duplicated) {
+      throw new BadRequestException('该代采单已入库，请勿重复操作');
+    }
 
     const record = await this.prisma.inboundRecord.create({
       data: {
@@ -119,6 +125,12 @@ export class WarehouseService {
     });
     if (!inbound) {
       throw new NotFoundException('入库记录不存在');
+    }
+    const alreadyOut = await this.prisma.outboundRecord.findFirst({
+      where: { tenantId: tid, inboundRecordId: inbound.id },
+    });
+    if (alreadyOut) {
+      throw new BadRequestException('该入库单已出库，请勿重复操作');
     }
     const dup = await this.prisma.outboundRecord.findFirst({
       where: { tenantId: tid, trackingNo: dto.trackingNo },

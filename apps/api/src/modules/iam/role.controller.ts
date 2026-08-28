@@ -1,6 +1,8 @@
 import { Controller, Get } from '@nestjs/common';
 import { RequirePermissions, SkipTenant } from '../../common/decorators/auth.decorators';
+import { CurrentUser } from '../../common/decorators/current.decorators';
 import { PrismaService } from '../../common/prisma/prisma.service';
+import { AuthUser } from '../auth/auth.types';
 
 @Controller('roles')
 @SkipTenant()
@@ -19,7 +21,7 @@ export class RoleController {
 
   @Get('catalog')
   @RequirePermissions('menu:role')
-  async catalog() {
+  async catalog(@CurrentUser() actor: AuthUser) {
     const roles = await this.prisma.role.findMany({
       orderBy: { code: 'asc' },
       select: {
@@ -36,7 +38,10 @@ export class RoleController {
         },
       },
     });
-    return roles.map((role) => ({
+    const visible = actor.roles.includes('SUPER_ADMIN')
+      ? roles
+      : roles.filter((role) => role.code !== 'SUPER_ADMIN');
+    return visible.map((role) => ({
       id: role.id,
       code: role.code,
       name: role.name,

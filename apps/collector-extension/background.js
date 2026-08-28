@@ -1,19 +1,27 @@
-import { collectorIdentity } from './jwt.js';
+import { collectorIdentity, isAllowedCollectorApi, normalizeCollectorApi, API_DEFAULT_VERSION, DEFAULT_COLLECTOR_API, resolveStoredCollectorApi } from './jwt.js';
 
 const DEFAULTS = {
-  api: 'http://localhost:3000/api/v1',
+  api: DEFAULT_COLLECTOR_API,
   token: '',
   tenant: '',
   crawlAllSkus: false,
+  apiHostVersion: 0,
 };
 
 let polling = false;
 
 async function settings() {
   const stored = await chrome.storage.local.get(DEFAULTS);
+  const api = resolveStoredCollectorApi(stored.api, stored.apiHostVersion);
+  if (api !== stored.api || stored.apiHostVersion !== API_DEFAULT_VERSION) {
+    await chrome.storage.local.set({ api, apiHostVersion: API_DEFAULT_VERSION });
+    stored.api = api;
+    stored.apiHostVersion = API_DEFAULT_VERSION;
+  }
   const identity = collectorIdentity(stored.token, stored.tenant);
   return {
     ...stored,
+    api,
     tenant: identity.tenantId,
     agentKey: identity.agentKey,
   };
@@ -21,15 +29,36 @@ async function settings() {
 
 async function api(path, options) {
   const cfg = await settings();
+  const apiBase = normalizeCollectorApi(cfg.api, DEFAULTS.api);
+  if (!isAllowedCollectorApi(apiBase)) {
+    throw new Error('API 地址非法，请填写 http(s):// 开头的后台地址');
+  }
   const headers = {
     'Content-Type': 'application/json',
     Authorization: 'Bearer ' + cfg.token,
   };
   if (cfg.tenant) headers['X-Tenant-Id'] = cfg.tenant;
-  const res = await fetch(cfg.api + path, { ...options, headers });
+  const res = await fetch(apiBase + path, { ...options, headers });
   const body = await res.json();
   if (body.code !== 0) throw new Error(body.message || 'API error');
   return body.data;
+}
+
+function isOzonHttpsUrl(raw) {
+  try {
+    const url = new URL(raw);
+    return url.protocol === 'https:' && /^(www\.)?ozon\.ru$/i.test(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isTrustedExtensionSender(sender) {
+  if (sender.tab) {
+    return false;
+  }
+  const prefix = chrome.runtime.getURL('');
+  return typeof sender.url === 'string' && sender.url.startsWith(prefix);
 }
 
 async function heartbeat() {
@@ -64,8 +93,147 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function ozonProductPath(tabUrl) {
+  try {
+    const path = new URL(tabUrl).pathname || '/';
+    return path.endsWith('/') ? path : path + '/';
+  } catch {
+    return '/';
+  }
+}
+
+async function harvestOzonComposer(tabId, tabUrl) {
+  if (!/\/product\//i.test(tabUrl) || isListingUrl(tabUrl)) {
+    return { pages: [], imgUrls: [] };
+  }
+  try {
+    const injected = await Promise.race([
+      chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'MAIN',
+        args: [ozonProductPath(tabUrl), String(tabUrl).match(/(\d{6,})\/?(?:[?#]|$)/)?.[1] || ''],
+        func: async (productPath, pageSku) => {
+          const origin = location.origin || 'https://www.ozon.ru';
+          const api = origin + '/api/composer-api.bx/page/json/v2?url=';
+          const paths = [productPath, productPath.replace(/\/$/, '')].filter(
+            (item, index, arr) => item && arr.indexOf(item) === index,
+          );
+          const pageUrls = paths.map((path) => api + encodeURIComponent(path));
+          const imgUrls = [];
+          function pushMaybe(value) {
+            if (typeof value === 'string' && value) imgUrls.push(value);
+            else if (value && typeof value === 'object') {
+              if (typeof value.url === 'string') imgUrls.push(value.url);
+              if (typeof value.link === 'string') imgUrls.push(value.link);
+              if (typeof value.src === 'string') imgUrls.push(value.src);
+            }
+          }
+          function isRecommendWidgetKey(key) {
+            return /tileGrid|skuGrid|recommend|similar|alsoBuy|boughtTogether|webList|collection|related/i.test(
+              String(key || ''),
+            );
+          }
+          function isPdpGalleryWidgetKey(key) {
+            if (isRecommendWidgetKey(key)) return false;
+            const name = String(key || '').split('-')[0];
+            if (/^webGallery/i.test(name)) return true;
+            if (/^(galleryMobile|pdpGallery|webProductGallery|webPhotoGallery|productGallery)$/i.test(name)) return true;
+            return /gallery/i.test(name) && !/tile|grid|list/i.test(name);
+          }
+          function isGalleryShapedWidget(widget) {
+            if (!widget || typeof widget !== 'object' || widget.tileImage || widget.mainState) {
+              return false;
+            }
+            if (Array.isArray(widget.items) && widget.items.some((item) => item && (item.tileImage || item.mainState))) {
+              return false;
+            }
+            const hasList = Array.isArray(widget.images) || Array.isArray(widget.media) || Array.isArray(widget.photos);
+            if (!hasList) return false;
+            if (widget.sku != null && pageSku && String(widget.sku) !== String(pageSku)) return false;
+            return Boolean(widget.coverImage) || Boolean(widget.sku) || (Array.isArray(widget.images) && widget.images.length >= 2);
+          }
+          function urlsFromGallery(json) {
+            const ws = json && json.widgetStates;
+            if (!ws || typeof ws !== 'object') return;
+            Object.keys(ws).forEach((key) => {
+              if (isRecommendWidgetKey(key)) return;
+              let widget = ws[key];
+              if (typeof widget === 'string') {
+                try {
+                  widget = JSON.parse(widget);
+                } catch (_e) {
+                  return;
+                }
+              }
+              if (!isPdpGalleryWidgetKey(key) && !isGalleryShapedWidget(widget)) return;
+              if (!widget || typeof widget !== 'object' || widget.tileImage || widget.mainState) return;
+              pushMaybe(widget.coverImage);
+              [].concat(widget.images || [], widget.media || [], widget.photos || []).forEach((item) => {
+                if (typeof item === 'string') {
+                  imgUrls.push(item);
+                  return;
+                }
+                if (!item || typeof item !== 'object') return;
+                ['src', 'url', 'original', 'image', 'link', 'file_name'].forEach((field) => pushMaybe(item[field]));
+              });
+            });
+          }
+          for (const pageUrl of pageUrls) {
+            try {
+              const res = await fetch(pageUrl, {
+                credentials: 'include',
+                headers: { accept: 'application/json' },
+              });
+              if (!res.ok) continue;
+              const text = await res.text();
+              try {
+                urlsFromGallery(JSON.parse(text));
+              } catch (_e) {
+                /* not json */
+              }
+              if (imgUrls.length) break;
+            } catch (_e) {
+              /* antibot / network */
+            }
+          }
+          document
+            .querySelectorAll(
+              '[data-widget*="webGallery"], [data-widget="galleryMobile"], [data-widget="pdpGallery"], [data-widget="webProductGallery"], [id*="webGallery"], [id*="state-webGallery"]',
+            )
+            .forEach((root) => {
+              root.querySelectorAll('img').forEach((el) => {
+                imgUrls.push(el.currentSrc || el.src || '');
+              });
+            });
+          return { imgUrls: imgUrls.filter(Boolean).slice(0, 40) };
+        },
+      }),
+      new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('composer timeout')), 15000);
+      }),
+    ]);
+    const result = injected && injected[0] && injected[0].result;
+    if (result && Array.isArray(result.imgUrls)) {
+      return { pages: [], imgUrls: result.imgUrls.filter(Boolean) };
+    }
+  } catch (_e) {
+    /* MAIN-world harvest is best-effort; content.js still extracts the DOM */
+  }
+  return { pages: [], imgUrls: [] };
+}
+
 async function extractTab(tabId, limit) {
-  const message = { type: 'EXTRACT', limit: Number(limit) > 0 ? Number(limit) : 80 };
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab || !isOzonHttpsUrl(String(tab.url || ''))) {
+    throw new Error('仅允许采集 ozon.ru 页面');
+  }
+  const harvest = await harvestOzonComposer(tabId, String(tab.url || ''));
+  const message = {
+    type: 'EXTRACT',
+    limit: Number(limit) > 0 ? Number(limit) : 80,
+    composerPages: harvest.pages,
+    extraImageUrls: harvest.imgUrls,
+  };
   try {
     const result = await chrome.tabs.sendMessage(tabId, message);
     if (result) return result;
@@ -300,6 +468,9 @@ async function enrichProductVariants(product) {
 }
 
 async function collectUrl(sourceUrl, waitMs) {
+  if (!isOzonHttpsUrl(sourceUrl)) {
+    throw new Error('仅允许打开 ozon.ru 商品页');
+  }
   const tab = await chrome.tabs.create({ url: sourceUrl, active: false });
   try {
     await waitTabComplete(tab.id, 25_000);
@@ -322,6 +493,9 @@ function isListingUrl(url) {
 }
 
 async function collectListing(sourceUrl, limit) {
+  if (!isOzonHttpsUrl(sourceUrl)) {
+    throw new Error('仅允许打开 ozon.ru 品类/搜索页');
+  }
   const cap = Number(limit) > 0 ? Number(limit) : 36;
   const tab = await chrome.tabs.create({ url: sourceUrl, active: false });
   const seen = {};
@@ -426,9 +600,7 @@ async function pollOnce() {
     return 'listing:' + urls.length;
   }
 
-  const product = item.crawlAllSkus
-    ? await enrichProductVariants(await collectUrl(item.sourceUrl))
-    : await collectUrl(item.sourceUrl);
+  const product = await collectUrl(item.sourceUrl);
   if (!isUsableProduct(product)) {
     await api('/collector/tasks/' + item.id + '/result', {
       method: 'POST',
@@ -436,6 +608,7 @@ async function pollOnce() {
         agentKey: cfg.agentKey,
         success: false,
         error: (product && product.blocked ? '页面被验证码拦截，请先在 Chrome 完成验证后再轮询' : '页面未解析到真实商品'),
+        failCode: product && product.blocked ? 'CAPTCHA_DETECTED' : 'COLLECT_FAILED',
       }),
     });
     return 'fail';
@@ -443,7 +616,7 @@ async function pollOnce() {
 
   await api('/collector/tasks/' + item.id + '/result', {
     method: 'POST',
-    body: JSON.stringify({ agentKey: cfg.agentKey, success: true, product: toIngestProduct(product, Boolean(item.crawlAllSkus)) }),
+    body: JSON.stringify({ agentKey: cfg.agentKey, success: true, product: toIngestProduct(product, false) }),
   });
   return 'ok:' + product.skuId;
 }
@@ -468,13 +641,12 @@ async function ingestCurrentTab(tabId) {
   if (!isUsableProduct(extracted)) {
     throw new Error(extracted && extracted.blocked ? '当前页被验证码拦截，请先完成验证' : '当前页未解析到真实商品');
   }
-  const cfg = await settings();
-  const product = cfg.crawlAllSkus ? await enrichProductVariants(extracted) : extracted;
+  const product = extracted;
   const data = await api('/collector/ingest', {
     method: 'POST',
     body: JSON.stringify({
-      ...toIngestProduct(product, Boolean(cfg.crawlAllSkus)),
-      crawlAllSkus: Boolean(cfg.crawlAllSkus),
+      ...toIngestProduct(product, false),
+      crawlAllSkus: false,
     }),
   });
   await chrome.storage.local.set({
@@ -483,7 +655,11 @@ async function ingestCurrentTab(tabId) {
   return data;
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!isTrustedExtensionSender(sender)) {
+    sendResponse({ ok: false, error: '拒绝未授权来源' });
+    return false;
+  }
   if (message.type === 'START') {
     polling = true;
     chrome.alarms.create('poll', { periodInMinutes: 1 });

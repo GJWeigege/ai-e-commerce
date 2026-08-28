@@ -11,25 +11,26 @@ import {
 import { detectCaptchaOrBlock } from '@aiecom/collector-core';
 import { withRetry, CaptchaDetectedError } from '@aiecom/collector-core';
 import { extractOzonProductFromHtml, buildSkuOptions } from '@aiecom/collector-core';
-import { buildOzonCategoryListingUrl, extractOzonProductUrls, isOzonListingUrl, pickOzonProductUrls } from '@aiecom/collector-core';
+import { buildOzonCategoryListingUrl, extractOzonProductUrls, isOzonListingUrl, pickOzonProductUrls, toAllowedCollectUrl } from '@aiecom/collector-core';
 import { alignSkuOptions, combineFamilyListings, fillSkuOptionsFromVariants, inferWeightOption, isSameOzonFamily, keepMainSkuOnly, ozonListingSlugFamily, productFamilyKey } from '@aiecom/shared';
 import { scoreProduct } from '@aiecom/llm-core';
 import { PRODUCT_REVIEW_QUEUE_STATUSES } from '../product/product-status';
 
 describe('parseProductUrlsFromCsv', () => {
   it('reads url column from header', () => {
-    const csv = 'name,url\nfoo,https://www.ozon.ru/product/1\nbar,https://www.ozon.ru/product/2';
+    const csv = 'name,url\nfoo,https://www.ozon.ru/product/item-1000001/\nbar,https://www.ozon.ru/product/item-2000002/';
     expect(parseProductUrlsFromCsv(csv)).toEqual([
-      'https://www.ozon.ru/product/1',
-      'https://www.ozon.ru/product/2',
+      'https://www.ozon.ru/product/item-1000001/',
+      'https://www.ozon.ru/product/item-2000002/',
     ]);
   });
 
-  it('treats each line as url when no header', () => {
-    expect(parseProductUrlsFromCsv('https://www.ozon.ru/a\nnot-a-url\nhttps://www.ozon.ru/b')).toEqual([
-      'https://www.ozon.ru/a',
-      'https://www.ozon.ru/b',
-    ]);
+  it('keeps ozon product urls and drops unrelated hosts', () => {
+    expect(
+      parseProductUrlsFromCsv(
+        'https://www.ozon.ru/product/item-1000001/\nhttps://evil.example/product/999999/\nnot-a-url',
+      ),
+    ).toEqual(['https://www.ozon.ru/product/item-1000001/']);
   });
 });
 
@@ -37,8 +38,9 @@ describe('mergeCollectorConfig', () => {
   it('defaults crawlAllSkus to false', () => {
     expect(mergeCollectorConfig().crawlAllSkus).toBe(false);
     expect(mergeCollectorConfig({}).crawlAllSkus).toBe(false);
-    expect(mergeCollectorConfig({ crawlAllSkus: 'true' }).crawlAllSkus).toBe(true);
-    expect(mergeCollectorConfig({ crawlAllSkus: true }).crawlAllSkus).toBe(true);
+    // 批量多规格暂时关闭：即便任务配置写了 true，运行时也只采当前 skuId
+    expect(mergeCollectorConfig({ crawlAllSkus: 'true' }).crawlAllSkus).toBe(false);
+    expect(mergeCollectorConfig({ crawlAllSkus: true }).crawlAllSkus).toBe(false);
   });
 
   it('parses optional collect filters from numbers or form strings', () => {
@@ -91,6 +93,11 @@ describe('ozon category listing url', () => {
   it('detects listing pages so chrome can expand them', () => {
     expect(isOzonListingUrl('https://www.ozon.ru/category/7511/')).toBe(true);
     expect(isOzonListingUrl('https://www.ozon.ru/product/bluzka-4000001111/')).toBe(false);
+    expect(isOzonListingUrl('https://evil.example/?next=ozon.ru/category/7511/')).toBe(false);
+    expect(toAllowedCollectUrl('https://evil.example/product/item-1000001/')).toBeNull();
+    expect(toAllowedCollectUrl('https://www.ozon.ru/product/item-1000001/')).toBe(
+      'https://www.ozon.ru/product/item-1000001/',
+    );
   });
 
   it('harvests extra listing urls so skipped products can be backfilled to topN', () => {
@@ -442,6 +449,219 @@ describe('ozon html extract', () => {
     const product = extractOzonProductFromHtml(html, 'https://www.ozon.ru/product/coffee-1085845200/');
     expect(product.imageUrls?.some((url) => /bag/i.test(url))).toBe(true);
     expect(product.imageUrls?.some((url) => /badge-tiny/i.test(url))).toBe(false);
+  });
+
+  it('reads current ozon gallery url/coverImage/media and does not collapse c600 variants', () => {
+    const html = `
+      <html>
+        <head>
+          <meta property="og:image" content="https://cdn1.ozonusercontent.com/s3/marketing-api/banners/xx/wc1200/promo.png" />
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1547167821',
+            name: 'Консервный нож Rondell RD-1877',
+            offers: { price: 85 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webGallery-pdp-1': JSON.stringify({
+                coverImage: 'https://ir.ozone.ru/s3/multimedia-1-z/c600/1111111111.jpg',
+                media: [
+                  { type: 'image', url: 'https://ir.ozone.ru/s3/multimedia-1-z/c600/1111111111.jpg' },
+                  { type: 'image', image: { url: 'https://ir.ozone.ru/s3/multimedia-1-y/c600/2222222222.jpg' } },
+                ],
+                images: [
+                  { url: 'https://ir.ozone.ru/s3/multimedia-1-z/c600/1111111111.jpg' },
+                  { url: 'https://ir.ozone.ru/s3/multimedia-1-y/c600/2222222222.jpg' },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body>
+          <h1>Консервный нож Rondell RD-1877</h1>
+          <div id="state-webGallery-1" data-widget="webGalleryPdp" data-state="${JSON.stringify({
+            images: [{ url: 'https://ir.ozone.ru/s3/multimedia-1-x/wc1200/3333333333.jpg' }],
+          }).replace(/"/g, '&quot;')}"></div>
+        </body>
+      </html>`;
+    const product = extractOzonProductFromHtml(
+      html,
+      'https://www.ozon.ru/product/konservnyy-nozh-rondell-rd-1877-1547167821/',
+    );
+    expect(product.imageUrls?.some((url) => url.includes('1111111111.jpg'))).toBe(true);
+    expect(product.imageUrls?.some((url) => url.includes('2222222222.jpg'))).toBe(true);
+    expect(product.imageUrls?.some((url) => url.includes('3333333333.jpg'))).toBe(true);
+    expect(product.imageUrls?.some((url) => /marketing-api|banners|promo/i.test(url))).toBe(false);
+  });
+
+  it('keeps webGallery photos and drops recommendation carousel images', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '3492958110',
+            name: 'Насадка для нарезки кубиками 6 мм',
+            offers: { price: 105 },
+            image: ['https://ir.ozone.ru/s3/multimedia-1/wc1200/dicer-main.jpg'],
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webGallery-pdp-1': JSON.stringify({
+                sku: 3492958110,
+                coverImage: 'https://ir.ozone.ru/s3/multimedia-1-z/wc1200/dicer-cover.jpg',
+                images: [
+                  { src: 'https://ir.ozone.ru/s3/multimedia-1-z/wc1200/dicer-cover.jpg' },
+                  { src: 'https://ir.ozone.ru/s3/multimedia-1-y/wc1200/dicer-side.jpg' },
+                ],
+              }),
+              'tileGridDesktop-recommend-1': JSON.stringify({
+                items: [
+                  {
+                    tileImage: { items: [{ image: { link: 'https://ir.ozone.ru/s3/multimedia-9/wc1200/slicer-other.jpg' } }] },
+                    action: { link: '/product/ovoreshchezka-1111111111/' },
+                  },
+                  {
+                    coverImage: 'https://ir-20.ozonstatic.cn/s3/multimedia-1/wc1200/mop-other.jpg',
+                    images: [{ src: 'https://ir.ozone.ru/s3/multimedia-8/wc1200/container-other.jpg' }],
+                  },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body>
+          <h1>Насадка для нарезки кубиками 6 мм</h1>
+          <img src="https://ir.ozone.ru/s3/multimedia-7/wc1200/recommend-bottom.jpg" />
+        </body>
+      </html>`;
+    const product = extractOzonProductFromHtml(
+      html,
+      'https://www.ozon.ru/product/nasadka-dlya-narezki-kubikami-6-mm-3492958110/',
+    );
+    expect(product.imageUrls?.some((url) => /dicer-cover|dicer-side|dicer-main/i.test(url))).toBe(true);
+    expect(product.imageUrls?.some((url) => /slicer-other|mop-other|container-other|recommend-bottom/i.test(url))).toBe(
+      false,
+    );
+  });
+
+  it('unwraps object-shaped characteristic titles and reads gallery img tags', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1547167821',
+            name: 'Консервный нож Rondell RD-1877',
+            offers: { price: 85 },
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webCharacteristics-1': JSON.stringify({
+                characteristics: [
+                  { title: { text: 'Тип' }, values: [{ text: 'Открывалка' }] },
+                  { name: { content: 'Цвет' }, values: [{ text: 'Черный' }, {}, { text: 'серый' }] },
+                  { title: { text: 'Длина, см' }, values: ['26'] },
+                ],
+              }),
+            },
+          })}</script>
+        </head>
+        <body>
+          <h1>Консервный нож Rondell RD-1877</h1>
+          <img src="//ir.ozone.ru/s3/multimedia-1-z/wc750/1547167821-a.jpg" />
+          <img data-src="https://ir-3.ozone.ru/s3/multimedia-1-y/c600/1547167821-b.jpg" />
+          <source srcset="https://ir.ozone.ru/s3/multimedia-1-x/wc1200/1547167821-c.jpg 2x" />
+        </body>
+      </html>`;
+    const product = extractOzonProductFromHtml(
+      html,
+      'https://www.ozon.ru/product/konservnyy-nozh-rondell-rd-1877-1547167821/',
+    );
+    expect(product.specs?.some((item) => item.name === '[object Object]')).toBe(false);
+    expect(product.specs?.some((item) => item.name === 'Тип' && item.value === 'Открывалка')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Цвет' && /Черный/.test(item.value) && /серый/.test(item.value))).toBe(
+      true,
+    );
+    expect(product.specs?.find((item) => item.name === 'Цвет')?.value).not.toMatch(/,\s*,/);
+    expect(product.imageUrls?.some((url) => url.includes('1547167821-a.jpg'))).toBe(true);
+    expect(product.imageUrls?.some((url) => url.includes('1547167821-b.jpg'))).toBe(true);
+    expect(product.imageUrls?.some((url) => url.includes('1547167821-c.jpg'))).toBe(true);
+  });
+
+  it('keeps ozonstatic.cn multimedia urls used as the china cdn for gallery photos', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1866087431',
+            name: 'Боул из нержавеющей стали с крышкой Pragma Sopdol, 5 л',
+            offers: { price: 116 },
+            image: ['https://ir-20.ozonstatic.cn/s3/multimedia-1-z/wc140/10326875500.jpg'],
+          })}</script>
+        </head>
+        <body>
+          <h1>Боул из нержавеющей стали с крышкой Pragma Sopdol, 5 л</h1>
+          <img src="https://ir-20.ozonstatic.cn/s3/multimedia-1-y/wc140/10326875542.jpg" />
+          <img src="https://ir-20.ozonstatic.cn/s3/multimedia-1-e/wc1200/10326876242.jpg" />
+        </body>
+      </html>`;
+    const product = extractOzonProductFromHtml(
+      html,
+      'https://www.ozon.ru/product/boul-iz-nerzhaveyushchey-stali-s-kryshkoy-pragma-sopdol-5-l-yandeks-fabrika-1866087431/',
+    );
+    expect(product.imageUrls?.some((url) => /ozonstatic\.cn/i.test(url) && /10326875542/.test(url))).toBe(true);
+    expect(product.imageUrls?.some((url) => /10326876242/.test(url))).toBe(true);
+    expect(product.imageUrls?.some((url) => /wc140/i.test(url))).toBe(false);
+    expect(product.imageUrls?.some((url) => /wc1200/i.test(url))).toBe(true);
+  });
+
+  it('reads textRs characteristic titles and composer-api webGallery coverImage', () => {
+    const html = `
+      <html>
+        <head>
+          <script type="application/ld+json">${JSON.stringify({
+            '@type': 'Product',
+            sku: '1547167821',
+            name: 'Консервный нож Rondell RD-1877',
+            offers: { price: 85 },
+          })}</script>
+        </head>
+        <body><h1>Консервный нож Rondell RD-1877</h1></body>
+      </html>`;
+    const composer = {
+      widgetStates: {
+        'webGallery-3121879-default-1': JSON.stringify({
+          sku: 1547167821,
+          coverImage: 'https://ir.ozone.ru/s3/multimedia-1-z/wc750/knife-cover.jpg',
+          images: [
+            { src: 'https://ir.ozone.ru/s3/multimedia-1-z/wc1200/knife-cover.jpg' },
+            { image: 'https://ir.ozone.ru/s3/multimedia-1-y/knife-side.jpg' },
+            { file_name: 'https://cdn1.ozone.ru/s3/multimedia-p/knife-box.jpg' },
+            { image: { link: 'https://ir.ozone.ru/s3/multimedia-1-x/knife-detail.jpg' } },
+          ],
+        }),
+        'webShortCharacteristics-1': JSON.stringify({
+          characteristics: [
+            { title: { textRs: [{ text: 'Тип' }] }, values: [{ text: 'Открывалка' }] },
+            { title: { textRs: [{ content: 'Материал' }] }, values: [{ textRs: [{ text: 'Пластик' }] }] },
+          ],
+        }),
+      },
+    };
+    const product = extractOzonProductFromHtml(
+      html.replace('</head>', `<script type="application/json">${JSON.stringify(composer)}</script></head>`),
+      'https://www.ozon.ru/product/konservnyy-nozh-rondell-rd-1877-1547167821/',
+    );
+    expect(product.specs?.some((item) => item.name === '[object Object]')).toBe(false);
+    expect(product.specs?.some((item) => item.name === 'Тип' && item.value === 'Открывалка')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Материал' && item.value === 'Пластик')).toBe(true);
+    expect(product.imageUrls?.some((url) => /knife-cover/i.test(url))).toBe(true);
+    expect(product.imageUrls?.some((url) => /knife-side/i.test(url))).toBe(true);
+    expect(product.imageUrls?.some((url) => /knife-box/i.test(url))).toBe(true);
+    expect(product.imageUrls?.some((url) => /knife-detail/i.test(url))).toBe(true);
   });
 
   it('reads standalone aspect widget without wrapping aspects array', () => {

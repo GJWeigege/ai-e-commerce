@@ -1,22 +1,90 @@
 const OZON_ORIGIN = 'https://www.ozon.ru';
 const PRODUCT_PATH = /\/product\/(?:[^/?#]+-)?(\d{6,})/i;
 
+export function isOzonHttpsHost(raw: string): boolean {
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== 'https:' || url.username || url.password) {
+      return false;
+    }
+    return /^(www\.)?ozon\.ru$/i.test(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+export function isSafeHttpsUrl(raw: string): boolean {
+  try {
+    const url = new URL(raw);
+    return url.protocol === 'https:' && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
 export function isOzonProductUrl(url: string): boolean {
-  return /ozon\.ru\/product\//i.test(String(url || ''));
+  const raw = String(url || '');
+  if (/^https?:\/\//i.test(raw) && !isOzonHttpsHost(raw)) {
+    return false;
+  }
+  return /(?:^|ozon\.ru)\/product\//i.test(raw) || /^\/product\//i.test(raw);
 }
 
 export function isOzonListingUrl(url: string): boolean {
   const raw = String(url || '');
-  if (isOzonProductUrl(raw)) {
+  if (!isOzonHttpsHost(raw)) {
     return false;
   }
-  return /ozon\.ru\/(?:category|search|highlight)\//i.test(raw) || /ozon\.ru\/search\?/i.test(raw);
+  const path = new URL(raw).pathname;
+  if (/\/product\//i.test(path)) {
+    return false;
+  }
+  return /\/(?:category|search|highlight)\//i.test(path) || path === '/search' || path === '/search/';
+}
+
+/** 任务/CSV/采集回传只接受 Ozon 商品页或品类/搜索页，避免插件打开任意 URL */
+export function toAllowedCollectUrl(raw: string): string | null {
+  const product = normalizeOzonProductUrl(raw);
+  if (product) {
+    return product;
+  }
+  const text = String(raw || '').trim();
+  if (!isOzonListingUrl(text)) {
+    return null;
+  }
+  const url = new URL(text);
+  url.hash = '';
+  return url.toString();
+}
+
+export function filterOzonCollectUrls(urls: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of urls) {
+    const url = toAllowedCollectUrl(item);
+    if (!url || seen.has(url)) {
+      continue;
+    }
+    seen.add(url);
+    out.push(url);
+  }
+  return out;
 }
 
 export function normalizeOzonProductUrl(raw: string): string | null {
   const text = String(raw || '').trim();
   if (!text || /\/product\/mock-/i.test(text)) {
     return null;
+  }
+  if (/^https?:\/\//i.test(text)) {
+    try {
+      const parsed = new URL(text);
+      if (!/^(www\.)?ozon\.ru$/i.test(parsed.hostname) || parsed.username || parsed.password) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
   }
   const match = text.match(PRODUCT_PATH);
   if (!match) {
@@ -94,6 +162,7 @@ function listingUrlFromValue(raw: string): string | null {
   }
   if (/^https?:\/\/(?:www\.)?ozon\.ru\//i.test(raw)) {
     const url = new URL(raw);
+    url.protocol = 'https:';
     url.hash = '';
     if (/\/product\//i.test(url.pathname)) {
       return null;

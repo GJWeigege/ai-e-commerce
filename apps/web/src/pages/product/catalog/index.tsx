@@ -20,6 +20,8 @@ import {
 } from '../../../services/product';
 import { Shop, fetchShopOptions } from '../../../services/shop';
 import { ProductPreviewDrawer } from '../ProductPreview';
+import { PackageGapBanner, PackageGapTags, PACKAGE_GAP_STYLE } from '../PackageGapNotice';
+import { inspectProductPackage, productHasPackageGap } from '../../../services/package-dims';
 import { useAuth } from '../../../auth';
 
 function listingColor(status?: Product['wbListingStatus']) {
@@ -80,6 +82,13 @@ export default function ProductCatalogPage() {
   }, []);
 
   const sampleProduct = shelfTarget?.mode === 'single' ? shelfTarget.product : shelfTarget?.products[0];
+  const listingPackageGaps = useMemo(() => {
+    if (!shelfTarget?.onShelf) {
+      return [];
+    }
+    const products = shelfTarget.mode === 'batch' ? shelfTarget.products : [shelfTarget.product];
+    return products.map((item) => ({ product: item, gaps: inspectProductPackage(item) })).filter((item) => item.gaps.missingSize || item.gaps.missingWeight);
+  }, [shelfTarget]);
   const pickerShops = useMemo(() => {
     if (!shelfTarget) {
       return [];
@@ -248,6 +257,13 @@ export default function ProductCatalogPage() {
     },
     { title: '库存', dataIndex: 'stock', search: false },
     {
+      title: '尺寸/重量',
+      dataIndex: 'packageDims',
+      search: false,
+      width: 140,
+      render: (_, row) => <PackageGapTags gaps={inspectProductPackage(row)} />,
+    },
+    {
       title: '状态',
       dataIndex: 'status',
       valueType: 'select',
@@ -330,7 +346,12 @@ export default function ProductCatalogPage() {
           </a>,
           ...(hasPermission('product:shelf') && canShowOnShelfAction(row)
             ? [
-                <Button key="on" type="link" onClick={() => openShelf(row, true)}>
+                <Button
+                  key="on"
+                  type="link"
+                  style={productHasPackageGap(row) ? { ...PACKAGE_GAP_STYLE, padding: 0, height: 'auto' } : undefined}
+                  onClick={() => openShelf(row, true)}
+                >
                   上架
                 </Button>,
               ]
@@ -405,7 +426,10 @@ export default function ProductCatalogPage() {
         }
         open={Boolean(shelfTarget)}
         confirmLoading={submitting}
-        okButtonProps={{ disabled: !selectedShopIds.length }}
+        okButtonProps={{
+          disabled: !selectedShopIds.length,
+          danger: Boolean(shelfTarget?.onShelf && listingPackageGaps.length),
+        }}
         width={720}
         onCancel={() => {
           setShelfTarget(null);
@@ -466,6 +490,16 @@ export default function ProductCatalogPage() {
       >
         {pickerShops.length ? (
           <>
+            {listingPackageGaps.length ? (
+              <PackageGapBanner
+                listing
+                gaps={{
+                  dimensions: {},
+                  missingSize: listingPackageGaps.some((item) => item.gaps.missingSize),
+                  missingWeight: listingPackageGaps.some((item) => item.gaps.missingWeight),
+                }}
+              />
+            ) : null}
             <Checkbox.Group
               style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}
               value={selectedShopIds}

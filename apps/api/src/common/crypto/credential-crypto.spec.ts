@@ -28,4 +28,10 @@ describe('credential-crypto', () => {
   it('rejects corrupted ciphertext', () => {
     expect(() => decryptSecret('aa:bb')).toThrow('店铺凭证密文已损坏');
   });
+
+  it('tells the operator to re-save the token when the encryption key does not match', () => {
+    const packed = encryptSecret('wb-content-token');
+    process.env.CREDENTIAL_ENCRYPTION_KEY = 'a-different-shop-key';
+    expect(() => decryptSecret(packed)).toThrow(/重新保存 Token/);
+  });
 });

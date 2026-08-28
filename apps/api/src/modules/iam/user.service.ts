@@ -1,6 +1,6 @@
 import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { RoleCode, UserStatus } from '@prisma/client';
-import { hashSync } from 'bcryptjs';
+import { hash } from 'bcryptjs';
 import { invalidOperatorModules } from '@aiecom/shared';
 import { PageQueryDto, PageResult } from '../../common/dto/page-query.dto';
 import { PrismaService } from '../../common/prisma/prisma.service';
@@ -106,7 +106,7 @@ export class UserService {
       data: {
         tenantId,
         username: dto.username,
-        passwordHash: hashSync(dto.password, 10),
+        passwordHash: await hash(dto.password, 12),
         realName: dto.realName,
         email: dto.email,
         phone: dto.phone,

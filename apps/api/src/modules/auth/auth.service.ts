@@ -7,6 +7,7 @@ import { LoginDto } from './dto/login.dto';
 import { AuthUser, JwtPayload } from './auth.types';
 
 const AUTH_USER_INCLUDE = {
+  tenant: { select: { status: true } },
   userRoles: {
     include: {
       role: true,
@@ -31,6 +32,9 @@ export class AuthService {
     });
 
     if (!user || user.status !== 'ACTIVE') {
+      throw new UnauthorizedException('用户名或密码错误');
+    }
+    if (user.tenantId && user.tenant?.status !== 'ACTIVE') {
       throw new UnauthorizedException('用户名或密码错误');
     }
 
@@ -61,6 +65,9 @@ export class AuthService {
       include: AUTH_USER_INCLUDE,
     });
     if (!user || user.status !== 'ACTIVE') {
+      return null;
+    }
+    if (user.tenantId && user.tenant?.status !== 'ACTIVE') {
       return null;
     }
     return this.toAuthUser(user);

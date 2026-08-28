@@ -12,10 +12,30 @@ import {
   StandardProduct,
 } from '@aiecom/shared';
 
-const IMAGE_HOST = /ozone\.ru|ozonusercontent\.com|cdn\d*\.ozon\.ru/i;
+const IMAGE_SIZE_DIR = /\/(?:wc|wcs|c)\d+\//i;
 
 function unescapeHtmlBlob(html: string): string {
   return html.replace(/\\u002[fF]/g, '/').replace(/\\\//g, '/');
+}
+
+/** Ozon 会换图床域名（ozone.ru → ozonstatic.cn），只认固定白名单会把整图集丢掉 */
+export function isOzonMediaHost(raw: string): boolean {
+  let href = String(raw || '').trim();
+  if (href.startsWith('//')) {
+    href = `https:${href}`;
+  }
+  try {
+    const host = new URL(href).hostname.toLowerCase();
+    if (/(?:^|\.)(ozone\.ru|ozonusercontent\.com)$/i.test(host)) {
+      return true;
+    }
+    if (/(?:^|\.)ozonstatic\.[a-z]+$/i.test(host)) {
+      return true;
+    }
+    return /ozon/i.test(host) && /^(ir(?:-\d+)?|cdn\d*)\./i.test(host);
+  } catch {
+    return /ozone\.ru|ozonusercontent\.com|ozonstatic\./i.test(raw);
+  }
 }
 
 export function parseOzonPrice(raw: unknown): number {
@@ -51,13 +71,16 @@ export function normalizeOzonImageUrl(raw: string): string | null {
   if (url.startsWith('//')) {
     url = `https:${url}`;
   }
-  if (!/^https?:\/\//i.test(url) || !IMAGE_HOST.test(url)) {
+  if (url.startsWith('/s3/')) {
+    url = `https://ir.ozone.ru${url}`;
+  }
+  if (!/^https?:\/\//i.test(url) || !isOzonMediaHost(url)) {
     return null;
   }
   if (/\.(svg|gif)(\?|$)/i.test(url) || /favicon|sprite|logo|pixel|1x1|avatar/i.test(url)) {
     return null;
   }
-  url = url.replace(/\/wc(?:18|28|50|75|100|200|240|400)\//i, '/wc1200/');
+  url = url.replace(/\/(?:wc|wcs)(?:18|28|50|75|100|140|160|180|200|240|250|300|400)\//i, '/wc1200/');
   return url.split('#')[0];
 }
 
@@ -66,28 +89,30 @@ export function isProductGalleryImage(raw: string): boolean {
   if (!url) {
     return false;
   }
-  if (/\/cms\/|\/graphics\/|\/icons?\/|\/static\/|\/promo\/|\/bonus\//i.test(url)) {
+  if (/\/cms\/|\/graphics\/|\/icons?\/|\/static\/|\/promo\/|\/bonus\/|\/marketing-api\/|\/banners?\//i.test(url)) {
     return false;
   }
   if (/(?:^|[/-])(?:logo|icon|badge|banner|sprite|avatar|favicon|payment|card-icon|flame)(?:[/-]|\.|$)/i.test(url)) {
     return false;
   }
-  return /\/s3\/multimedia/i.test(url) || /ozonusercontent\.com\/s3\/multimedia/i.test(url);
+  return /\/s3\/(?:multimedia|rp-photo)/i.test(url) || /\/multimedia(?:-\w+)?\//i.test(url);
 }
 
 function mediaKey(url: string): string {
-  const match = url.match(/multimedia[^/]*\/(?:wc\d+\/)?([^/?]+)/i);
+  const match =
+    url.match(/multimedia[^/]*\/(?:(?:wc|wcs|c)\d+\/)?([^/?#]+)/i) ||
+    url.match(/rp-photo[^/]*\/(?:(?:wc|wcs|c)\d+\/)?([^/?#]+)/i);
   return match?.[1] ?? url.split('?')[0];
 }
 
 function imageRank(url: string): number {
-  if (/\/wc(?:1200|2000|2500)\//i.test(url)) {
+  if (/\/wc(?:1200|1500|2000|2500)\//i.test(url)) {
     return 4;
   }
   if (/\/wc1000\//i.test(url)) {
     return 3;
   }
-  if (/\/multimedia/i.test(url) && !/\/wc\d+\//i.test(url)) {
+  if (/\/(?:multimedia|rp-photo)/i.test(url) && !IMAGE_SIZE_DIR.test(url)) {
     return 5;
   }
   return 1;
@@ -186,6 +211,19 @@ function collectJsonTrees(html: string): unknown[] {
       if (parsed) {
         trees.push(parsed);
       }
+    }
+  }
+  const stateRe = /data-state=(["'])([\s\S]*?)\1/gi;
+  let stateMatch: RegExpExecArray | null;
+  while ((stateMatch = stateRe.exec(html)) !== null) {
+    const decoded = stateMatch[2]
+      .replace(/&quot;/g, '"')
+      .replace(/&#34;/g, '"')
+      .replace(/&amp;/g, '&')
+      .replace(/&#39;/g, "'");
+    const parsed = parseJsonSafe(decoded);
+    if (parsed) {
+      trees.push(parsed);
     }
   }
   return trees;
@@ -288,7 +326,7 @@ function mergeSpecs(groups: ProductSpec[][]): ProductSpec[] {
   for (const group of groups) {
     for (const spec of group) {
       const key = `${spec.name}=${spec.value}`;
-      if (seen.has(key) || spec.name === '商品描述') {
+      if (seen.has(key) || spec.name === '商品描述' || spec.name === '[object Object]') {
         continue;
       }
       seen.add(key);
@@ -345,30 +383,154 @@ function isTinyOrBadgeImage(rec: Record<string, unknown>): boolean {
   return Number.isFinite(width) && Number.isFinite(height) && Math.max(width, height) > 0 && Math.max(width, height) < 200;
 }
 
-function collectGalleryImagesFromTree(trees: unknown[]): string[] {
-  const urls: string[] = [];
-  for (const tree of trees) {
-    walkJson(tree, (obj) => {
-      if (!Array.isArray(obj.images) || obj.images.length === 0) {
+function imageUrlsFromUnknown(raw: unknown, depth = 0): string[] {
+  if (depth > 5 || raw == null) {
+    return [];
+  }
+  if (typeof raw === 'string') {
+    if (raw.startsWith('/s3/')) {
+      return [`https://ir.ozone.ru${raw}`];
+    }
+    return raw.startsWith('http') || raw.startsWith('//') ? [raw] : [];
+  }
+  if (Array.isArray(raw)) {
+    return raw.flatMap((item) => imageUrlsFromUnknown(item, depth + 1));
+  }
+  const rec = asRecord(raw);
+  if (!rec || isTinyOrBadgeImage(rec)) {
+    return [];
+  }
+  const keys = [
+    'original',
+    'src',
+    'url',
+    'image',
+    'coverImage',
+    'coverImageUrl',
+    'previewUrl',
+    'srcBig',
+    'picture',
+    'file_name',
+    'link',
+  ];
+  return keys.flatMap((key) => imageUrlsFromUnknown(rec[key], depth + 1));
+}
+
+function isRecommendWidgetKey(key: string): boolean {
+  return /tileGrid|skuGrid|recommend|similar|alsoBuy|boughtTogether|webList|collection|related/i.test(
+    String(key || ''),
+  );
+}
+
+function isPdpGalleryWidgetKey(key: string): boolean {
+  if (isRecommendWidgetKey(key)) {
+    return false;
+  }
+  const name = String(key || '').split('-')[0];
+  if (/^webGallery/i.test(name)) {
+    return true;
+  }
+  if (/^(galleryMobile|pdpGallery|webProductGallery|webPhotoGallery|productGallery)$/i.test(name)) {
+    return true;
+  }
+  return /gallery/i.test(name) && !/tile|grid|list/i.test(name);
+}
+
+function isGalleryShapedWidget(raw: unknown, skuId = ''): boolean {
+  const rec = asRecord(raw);
+  if (!rec || rec.tileImage || rec.mainState) {
+    return false;
+  }
+  if (Array.isArray(rec.items) && rec.items.some((item) => asRecord(item)?.tileImage || asRecord(item)?.mainState)) {
+    return false;
+  }
+  const hasList = Array.isArray(rec.images) || Array.isArray(rec.media) || Array.isArray(rec.photos);
+  if (!hasList) {
+    return false;
+  }
+  if (rec.sku != null && skuId && String(rec.sku) !== String(skuId)) {
+    return false;
+  }
+  return Boolean(rec.coverImage) || Boolean(rec.sku) || (Array.isArray(rec.images) && rec.images.length >= 2);
+}
+
+function collectImagesFromGalleryWidget(raw: unknown): string[] {
+  const rec = asRecord(raw);
+  if (!rec || rec.tileImage || rec.mainState) {
+    return [];
+  }
+  const urls = [...imageUrlsFromUnknown(rec.coverImage), ...imageUrlsFromUnknown(rec.coverImageUrl)];
+  for (const key of ['images', 'media', 'photos', 'gallery']) {
+    const items = rec[key];
+    if (!Array.isArray(items) || items.length === 0) {
+      continue;
+    }
+    items.forEach((item) => {
+      if (typeof item === 'string') {
+        urls.push(item);
         return;
       }
-      obj.images.forEach((item) => {
-        if (typeof item === 'string') {
-          urls.push(item);
-          return;
-        }
-        const rec = asRecord(item);
-        if (!rec || isTinyOrBadgeImage(rec)) {
-          return;
-        }
-        if (typeof rec.original === 'string') {
-          urls.push(rec.original);
-        }
-        if (typeof rec.src === 'string') {
-          urls.push(rec.src);
-        }
-      });
+      const row = asRecord(item);
+      if (!row || isTinyOrBadgeImage(row)) {
+        return;
+      }
+      const kind = String(row.type ?? row.kind ?? row.role ?? row.mediaType ?? '');
+      if (kind && /video|youtube|mp4/i.test(kind) && !/image|photo|picture/i.test(kind)) {
+        return;
+      }
+      urls.push(...imageUrlsFromUnknown(row));
     });
+  }
+  return urls;
+}
+
+function collectGalleryImagesFromTree(trees: unknown[], html = '', skuId = ''): string[] {
+  const urls: string[] = [];
+  for (const tree of trees) {
+    const rec = asRecord(tree);
+    const states = asRecord(rec?.widgetStates);
+    if (!states) {
+      continue;
+    }
+    for (const [key, value] of Object.entries(states)) {
+      if (isRecommendWidgetKey(key)) {
+        continue;
+      }
+      const parsed = typeof value === 'string' ? parseJsonSafe(value) : value;
+      if (!isPdpGalleryWidgetKey(key) && !isGalleryShapedWidget(parsed, skuId)) {
+        continue;
+      }
+      urls.push(...collectImagesFromGalleryWidget(parsed));
+    }
+  }
+  const tagRe = /<(?:div|section)[^>]*(?:data-widget="[^"]*webGallery[^"]*"|id="[^"]*webGallery[^"]*")[^>]*>/gi;
+  let tagMatch: RegExpExecArray | null;
+  while ((tagMatch = tagRe.exec(html)) !== null) {
+    const state = tagMatch[0].match(/data-state=(["'])([\s\S]*?)\1/i);
+    if (!state) {
+      continue;
+    }
+    const decoded = state[2]
+      .replace(/&quot;/g, '"')
+      .replace(/&#34;/g, '"')
+      .replace(/&amp;/g, '&')
+      .replace(/&#39;/g, "'");
+    urls.push(...collectImagesFromGalleryWidget(parseJsonSafe(decoded)));
+  }
+  return urls;
+}
+
+function collectMultimediaUrlsFromBlob(blob: string): string[] {
+  const urls: string[] = [];
+  const re =
+    /(?:https?:)?\/\/[a-z0-9.-]*ozon[a-z0-9.-]*\/s3\/(?:multimedia|rp-photo)[^"'\\\s<>]+/gi;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(blob)) !== null) {
+    urls.push(match[0].replace(/[\\,;.]+$/, ''));
+  }
+  const attrRe = /(?:src|data-src|data-original|data-lazy|srcset)=["']([^"']+)["']/gi;
+  while ((match = attrRe.exec(blob)) !== null) {
+    match[1].split(',').forEach((part) => urls.push(part.trim().split(/\s+/)[0]));
   }
   return urls;
 }
@@ -416,18 +578,43 @@ export function cleanAspectChipText(raw: unknown): string {
   return token;
 }
 
-function textFromUnknown(raw: unknown): string {
-  if (raw == null) {
+function textFromUnknown(raw: unknown, depth = 0): string {
+  if (depth > 5 || raw == null) {
     return '';
   }
   if (typeof raw === 'string' || typeof raw === 'number') {
-    return String(raw);
+    const text = String(raw).replace(/\s+/g, ' ').trim();
+    return text === '[object Object]' ? '' : text;
+  }
+  if (Array.isArray(raw)) {
+    return raw
+      .map((item) => textFromUnknown(item, depth + 1))
+      .filter(Boolean)
+      .join(', ');
   }
   const rec = asRecord(raw);
   if (!rec) {
     return '';
   }
-  return String(rec.text ?? rec.title ?? rec.value ?? rec.name ?? rec.content ?? '');
+  for (const key of [
+    'text',
+    'content',
+    'textRs',
+    'contentRS',
+    'valueRs',
+    'title',
+    'value',
+    'name',
+    'label',
+    'key',
+    'caption',
+  ]) {
+    const found = textFromUnknown(rec[key], depth + 1);
+    if (found) {
+      return found;
+    }
+  }
+  return '';
 }
 
 function aspectChipValue(rec: Record<string, unknown>): string {
@@ -845,20 +1032,14 @@ const CHARACTERISTIC_ROW_KEYS = [
 ];
 
 function characteristicText(values: unknown): string {
-  if (typeof values === 'string' || typeof values === 'number') {
-    return String(values);
-  }
-  if (!Array.isArray(values)) {
+  if (values == null) {
     return '';
   }
+  if (!Array.isArray(values)) {
+    return textFromUnknown(values);
+  }
   return values
-    .map((item) => {
-      if (typeof item === 'string' || typeof item === 'number') {
-        return String(item);
-      }
-      const inner = asRecord(item);
-      return String(inner?.text ?? inner?.value ?? inner?.title ?? '');
-    })
+    .map((item) => textFromUnknown(item))
     .filter(Boolean)
     .join(', ');
 }
@@ -877,9 +1058,11 @@ function collectCharacteristicsFromTree(trees: unknown[]): ProductSpec[] {
           if (!rec) {
             continue;
           }
-          const name = String(rec.title ?? rec.name ?? rec.key ?? '').trim();
-          const text = characteristicText(rec.values ?? rec.value).replace(/\s+/g, ' ').trim();
-          if (name && text) {
+          const name = textFromUnknown(rec.title ?? rec.name ?? rec.key).trim();
+          const text = characteristicText(rec.values ?? rec.contentRS ?? rec.valueRs ?? rec.value)
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (name && name !== '[object Object]' && text && text !== '[object Object]') {
             specs.push({ name, value: text });
           }
         }
@@ -1086,7 +1269,13 @@ export function extractOzonProductFromHtml(html: string, pageUrl: string): Parti
   const description =
     treeDescription || (typeof jsonLd.description === 'string' ? jsonLd.description.trim() : '') || undefined;
   const og = blob.match(/property=["']og:image["'][^>]*content=["']([^"']+)["']/i);
-  const gallery = uniqueOzonImages([...collectJsonLdImages(jsonLd), ...collectGalleryImagesFromTree(trees)]);
+  const fromGallery = collectGalleryImagesFromTree(trees, blob, skuId);
+  const fromLd = collectJsonLdImages(jsonLd);
+  const gallery = uniqueOzonImages(
+    fromGallery.length
+      ? [...fromGallery, ...fromLd]
+      : [...fromLd, ...collectMultimediaUrlsFromBlob(blob), og?.[1]],
+  );
   const imageUrls = gallery.length ? gallery : uniqueOzonImages([og?.[1]]);
   const treePrices = collectPricesFromTree(trees);
   const price = offerPrice(jsonLd) || treePrices.price;

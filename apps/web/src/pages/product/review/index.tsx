@@ -3,7 +3,9 @@ import { Button, Image, Space, message } from 'antd';
 import { useRef, useState } from 'react';
 import type { ActionType, ProColumns } from '@ant-design/pro-components';
 import { Product, fetchProducts, reviewProducts, updateProduct } from '../../../services/product';
+import { inspectProductPackage } from '../../../services/package-dims';
 import { ProductPreviewDrawer } from '../ProductPreview';
+import { PackageGapTags } from '../PackageGapNotice';
 
 export default function ProductReviewPage() {
   const actionRef = useRef<ActionType>();
@@ -37,6 +39,13 @@ export default function ProductReviewPage() {
       render: (_, row) => row.imageUrls?.length || (row.mainImageUrl ? 1 : 0),
     },
     { title: '售价', dataIndex: 'price', search: false },
+    {
+      title: '尺寸/重量',
+      dataIndex: 'packageDims',
+      search: false,
+      width: 140,
+      render: (_, row) => <PackageGapTags gaps={inspectProductPackage(row)} />,
+    },
     { title: '库存', dataIndex: 'stock', search: false },
     { title: 'AI 得分', search: false, render: (_, row) => row.aiSelection?.score ?? '-' },
     { title: '利润预估', search: false, render: (_, row) => row.aiSelection?.profitEstimate ?? '-' },

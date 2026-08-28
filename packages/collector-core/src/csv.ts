@@ -1,3 +1,5 @@
+import { filterOzonCollectUrls } from './ozon-urls';
+
 const URL_HEADER = /^(url|link|商品链接|商品url|ozon.?url)$/i;
 
 export function parseProductUrlsFromCsv(content: string): string[] {
@@ -24,7 +26,7 @@ export function parseProductUrlsFromCsv(content: string): string[] {
       urls.push(raw);
     }
   }
-  return [...new Set(urls)];
+  return filterOzonCollectUrls(urls);
 }
 
 function splitCsvLine(line: string): string[] {

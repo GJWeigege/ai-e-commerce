@@ -1,3 +1,4 @@
+import { hasPackageDimensionValue, mapPackageDimensions } from '@aiecom/shared';
 import {
   WbCardCharacteristic,
   WbCardSize,
@@ -7,6 +8,8 @@ import {
   WbProductDraft,
   WbSubject,
 } from './wb-listing.types';
+
+export { mapPackageDimensions as mapWbDimensions, parseDimensionNumber } from '@aiecom/shared';
 
 const CHAR_ALIASES: Record<string, string[]> = {
   color: ['цвет', 'color', 'colour', '颜色', 'цвет товара'],
@@ -146,22 +149,6 @@ const COLOR_SYNONYMS: Record<string, string> = {
   'желтый': 'желтый',
   'жёлтый': 'желтый',
   '黄色': 'желтый',
-};
-
-const DIM_KEYS = {
-  length: ['длина', 'length', '长', 'глубина', 'depth', 'длина упаковки'],
-  width: ['ширина', 'width', '宽', 'ширина упаковки'],
-  height: ['высота', 'height', '高', 'толщина', 'thickness', 'высота упаковки'],
-  weight: ['вес', 'weight', '重量', 'вес брутто', 'вес товара', 'вес с упаковкой'],
-};
-
-const COMBINED_SIZE_RE =
-  /(\d+(?:[.,]\d+)?)\s*[xх×*]\s*(\d+(?:[.,]\d+)?)(?:\s*[xх×*]\s*(\d+(?:[.,]\d+)?))?\s*(мм|mm|см|cm)?/gi;
-
-type WbDimensionSource = {
-  name?: string | null;
-  description?: string | null;
-  skuOptions?: Array<{ name?: string; options?: Record<string, string> }>;
 };
 
 export function stripWbForbiddenChars(text: string): string {
@@ -340,195 +327,6 @@ export function pickWbSubject(subjects: WbSubject[], queries: string[]): WbSubje
     }
   }
   return best && best.score >= 25 ? best.subject : null;
-}
-
-export function parseDimensionNumber(
-  raw: string,
-  kind: 'length' | 'width' | 'height' | 'weight',
-  context = '',
-): number | null {
-  const value = String(raw || '').replace(',', '.').trim();
-  const num = Number(value.replace(/[^0-9.]/g, ''));
-  if (!Number.isFinite(num) || num <= 0) {
-    return null;
-  }
-  const text = `${context} ${value}`.toLowerCase();
-  if (kind === 'weight') {
-    if (/кг|kg/i.test(text)) {
-      return Math.max(0.01, num);
-    }
-    if (/г(?!р)|g\b|gram/i.test(text)) {
-      return Math.max(0.01, num / 1000);
-    }
-    return num;
-  }
-  if (/мм|mm/i.test(text)) {
-    return Math.max(0.1, num / 10);
-  }
-  if (/м(?!м)|m\b/i.test(text) && !/см|cm/i.test(text)) {
-    return Math.max(1, num * 100);
-  }
-  return num;
-}
-
-function looksLikeCombinedSize(value: string): boolean {
-  return /[xх×*]/.test(value) && (value.match(/\d+/g) || []).length >= 2;
-}
-
-function parseCombinedSize(text: string): { length: number; width: number; height: number } | null {
-  COMBINED_SIZE_RE.lastIndex = 0;
-  let best: { length: number; width: number; height: number; volume: number } | null = null;
-  let match: RegExpExecArray | null;
-  while ((match = COMBINED_SIZE_RE.exec(String(text || ''))) !== null) {
-    const unit = (match[4] || '').toLowerCase();
-    if (!match[3] && !unit) {
-      continue;
-    }
-    const toCm = (raw: string) => {
-      const num = Number(String(raw).replace(',', '.'));
-      if (!Number.isFinite(num) || num <= 0) {
-        return 0;
-      }
-      return unit === 'мм' || unit === 'mm' ? num / 10 : num;
-    };
-    const edges = [toCm(match[1]), toCm(match[2]), match[3] ? toCm(match[3]) : 0]
-      .filter((item) => item > 0)
-      .sort((a, b) => b - a);
-    if (!edges.length) {
-      continue;
-    }
-    const length = edges[0];
-    const width = edges[1] || 0;
-    const height = edges[2] || 0;
-    const volume = length * (width || 1) * (height || 1);
-    if (!best || volume > best.volume) {
-      best = { length, width, height, volume };
-    }
-  }
-  return best ? { length: best.length, width: best.width, height: best.height } : null;
-}
-
-function parseWeightFromText(text: string): number | null {
-  const cleaned = String(text || '').replace(/\/\s*100\s*(?:г|гр|g)\b/gi, ' ');
-  let best = 0;
-  for (const match of cleaned.matchAll(/(\d+(?:[.,]\d+)?)\s*(кг|kg)\b/gi)) {
-    const num = Number(match[1].replace(',', '.'));
-    if (Number.isFinite(num) && num > 0) {
-      best = Math.max(best, num);
-    }
-  }
-  for (const match of cleaned.matchAll(/(\d+(?:[.,]\d+)?)\s*(г(?![а-яё])|g\b|грамм)/gi)) {
-    const num = Number(match[1].replace(',', '.'));
-    if (Number.isFinite(num) && num > 0) {
-      best = Math.max(best, num / 1000);
-    }
-  }
-  return best > 0 ? best : null;
-}
-
-function parseLongestEdgeFromText(text: string): number {
-  let best = 0;
-  for (const match of String(text || '').matchAll(/(\d+(?:[.,]\d+)?)\s*(мм|mm|см|cm)(?![a-zа-яё])/gi)) {
-    const num = Number(match[1].replace(',', '.'));
-    if (!Number.isFinite(num) || num <= 0) {
-      continue;
-    }
-    const unit = match[2].toLowerCase();
-    const cm = unit === 'мм' || unit === 'mm' ? num / 10 : num;
-    if (cm >= 1 && cm <= 500) {
-      best = Math.max(best, cm);
-    }
-  }
-  return best;
-}
-
-function isProductWeightName(name: string): boolean {
-  const key = normalizeKey(name);
-  return /товар|нетто|net\b/.test(key) && !/упаков|брутто|brutto/.test(key);
-}
-
-function ceilKg(value: number): number {
-  return Math.max(0.01, Math.ceil(value * 1000) / 1000);
-}
-
-export function mapWbDimensions(
-  specs: Array<{ name: string; value: string }>,
-  source?: WbDimensionSource,
-): {
-  length: number;
-  width: number;
-  height: number;
-  weightBrutto: number;
-} {
-  const rows: Array<{ name: string; value: string }> = [
-    ...specs,
-    ...(source?.skuOptions || []).flatMap((item) =>
-      Object.entries(item.options || {}).map(([name, value]) => ({ name, value: String(value) })),
-    ),
-  ];
-  const found = { length: 0, width: 0, height: 0, weightBrutto: 0 };
-  let productWeight = 0;
-
-  for (const spec of rows) {
-    const key = normalizeKey(spec.name);
-    if (looksLikeCombinedSize(spec.value) && !DIM_KEYS.weight.some((alias) => key.includes(alias))) {
-      continue;
-    }
-    (Object.keys(DIM_KEYS) as Array<keyof typeof DIM_KEYS>).forEach((dim) => {
-      if (!DIM_KEYS[dim].some((alias) => key.includes(alias))) {
-        return;
-      }
-      const parsed = parseDimensionNumber(spec.value, dim === 'weight' ? 'weight' : dim, spec.name);
-      if (!parsed) {
-        return;
-      }
-      if (dim === 'weight') {
-        found.weightBrutto = Math.max(found.weightBrutto, parsed);
-        if (isProductWeightName(spec.name)) {
-          productWeight = Math.max(productWeight, parsed);
-        }
-      } else {
-        found[dim] = Math.max(found[dim], parsed);
-      }
-    });
-  }
-
-  for (const spec of rows) {
-    if (isSizeDimensionKey(spec.name) && !looksLikeCombinedSize(spec.value)) {
-      continue;
-    }
-    const combined = parseCombinedSize(`${spec.name} ${spec.value}`);
-    if (!combined) {
-      continue;
-    }
-    found.length = Math.max(found.length, combined.length);
-    found.width = Math.max(found.width, combined.width);
-    found.height = Math.max(found.height, combined.height);
-  }
-
-  const blob = [source?.name, source?.description, ...(source?.skuOptions || []).map((item) => item.name || '')]
-    .filter(Boolean)
-    .join(' ');
-  const fromText = parseCombinedSize(blob);
-  if (fromText) {
-    found.length = Math.max(found.length, fromText.length);
-    found.width = Math.max(found.width, fromText.width);
-    found.height = Math.max(found.height, fromText.height);
-  }
-  const textWeight = parseWeightFromText(blob);
-  if (textWeight) {
-    found.weightBrutto = Math.max(found.weightBrutto, textWeight);
-    productWeight = Math.max(productWeight, textWeight);
-  }
-  found.length = Math.max(found.length, parseLongestEdgeFromText(blob));
-
-  const weight = productWeight > 0 ? Math.max(found.weightBrutto, productWeight + 0.05) : found.weightBrutto;
-  return {
-    length: Math.max(1, Math.ceil(found.length || 20)),
-    width: Math.max(1, Math.ceil(found.width || 15)),
-    height: Math.max(1, Math.ceil(found.height || 10)),
-    weightBrutto: ceilKg(weight || 0.3),
-  };
 }
 
 function isSizeDimensionKey(key: string): boolean {
@@ -827,7 +625,7 @@ export function buildWbUploadPayload(input: {
   brand: string;
   sized?: boolean;
 }): WbCardUploadItem[] {
-  const dimensions = mapWbDimensions(input.draft.specs, input.draft);
+  const dimensions = mapPackageDimensions(input.draft.specs, input.draft);
   const sized = input.sized ?? isWbSizedDraft(input.draft, input.subject);
   const mapped = mapWbSizes(input.draft, input.barcodes, { sized }).filter((item) => item.skus.length);
   const fallback = [
@@ -860,7 +658,7 @@ export function buildWbUploadPayload(input: {
             brand: input.draft.brand,
           }),
           brand: input.brand,
-          dimensions,
+          ...(hasPackageDimensionValue(dimensions) ? { dimensions } : {}),
           characteristics: input.characteristics,
           sizes,
         },

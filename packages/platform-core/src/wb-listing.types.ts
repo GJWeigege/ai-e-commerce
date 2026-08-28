@@ -42,11 +42,11 @@ export type WbCardUploadItem = {
     title: string;
     description: string;
     brand: string;
-    dimensions: {
-      length: number;
-      width: number;
-      height: number;
-      weightBrutto: number;
+    dimensions?: {
+      length?: number;
+      width?: number;
+      height?: number;
+      weightBrutto?: number;
     };
     characteristics: WbCardCharacteristic[];
     sizes: WbCardSize[];
@@ -100,7 +100,7 @@ export type WbCardUpdateItem = {
   title: string;
   description: string;
   brand: string;
-  dimensions: WbCardUploadItem['variants'][number]['dimensions'];
+  dimensions?: WbCardUploadItem['variants'][number]['dimensions'];
   characteristics: WbCardCharacteristic[];
   sizes: Array<{ chrtID?: number; techSize?: string; wbSize?: string; skus: string[]; price?: number }>;
 };

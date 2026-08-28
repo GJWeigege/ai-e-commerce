@@ -5,9 +5,15 @@ import { PERMISSIONS, permissionCodesForRole, OPERATOR_ASSIGNABLE_MODULE_CODES }
 const prisma = new PrismaClient();
 
 async function main() {
-  const adminPassword = process.env.SEED_ADMIN_PASSWORD ?? 'Admin@123456';
-  const demoPassword = process.env.SEED_DEMO_PASSWORD ?? 'Demo@123456';
-  const adminUsername = process.env.SEED_ADMIN_USERNAME ?? 'admin';
+  const isProd = process.env.NODE_ENV === 'production';
+  const adminPassword = process.env.SEED_ADMIN_PASSWORD || (isProd ? '' : 'Admin@123456');
+  const demoPassword = process.env.SEED_DEMO_PASSWORD || (isProd ? '' : 'Demo@123456');
+  const adminUsername = process.env.SEED_ADMIN_USERNAME || 'admin';
+  if (isProd) {
+    if (!adminPassword || adminPassword.length < 12 || !demoPassword || demoPassword.length < 12) {
+      throw new Error('生产环境 RUN_SEED 必须设置至少 12 位的 SEED_ADMIN_PASSWORD 与 SEED_DEMO_PASSWORD');
+    }
+  }
 
   const roles = await Promise.all(
     (
@@ -185,9 +191,13 @@ async function main() {
   });
 
   console.log('Seed completed');
-  console.log(`  super admin: ${adminUsername} / ${adminPassword}`);
-  console.log(`  demo admin : demo_admin / ${demoPassword}`);
-  console.log(`  demo operator: demo_op / ${demoPassword}`);
+  if (isProd) {
+    console.log('  admin accounts created (passwords are not logged)');
+  } else {
+    console.log(`  super admin: ${adminUsername} / ${adminPassword}`);
+    console.log(`  demo admin : demo_admin / ${demoPassword}`);
+    console.log(`  demo operator: demo_op / ${demoPassword}`);
+  }
 }
 
 main()

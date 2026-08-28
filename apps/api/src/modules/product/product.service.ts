@@ -442,7 +442,7 @@ export class ProductService {
       const unrecoverable =
         error instanceof UnrecoverableError ||
         isWbVendorCodeConflict(message) ||
-        /无法匹配|缺少|未配置|必填|не более \d+ символов|Описание|description|бренд.*не найден|безразмерн|Размер и Рос/i.test(
+        /无法匹配|缺少|未配置|无法解密|重新保存 Token|密文已损坏|必填|не более \d+ символов|Описание|description|бренд.*не найден|безразмерн|Размер и Рос/i.test(
           message,
         );
       await this.prisma.productShopListing.updateMany({

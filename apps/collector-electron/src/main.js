@@ -3,6 +3,23 @@ const path = require('path');
 
 let mainWindow;
 
+function isOzonHttpsUrl(raw) {
+  try {
+    const url = new URL(String(raw || ''));
+    return url.protocol === 'https:' && /^(www\.)?ozon\.ru$/i.test(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+const hardenedWebPrefs = {
+  javascript: true,
+  contextIsolation: true,
+  nodeIntegration: false,
+  sandbox: true,
+  webSecurity: true,
+};
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1100,
@@ -11,19 +28,42 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
     },
   });
   mainWindow.loadFile(path.join(__dirname, 'renderer.html'));
 }
 
 ipcMain.handle('open-ozon-login', async () => {
-  const loginWin = new BrowserWindow({ width: 1200, height: 800 });
+  const loginWin = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    webPreferences: hardenedWebPrefs,
+  });
+  loginWin.webContents.on('will-navigate', (event, url) => {
+    if (!isOzonHttpsUrl(url)) {
+      event.preventDefault();
+    }
+  });
   await loginWin.loadURL('https://www.ozon.ru/');
   return true;
 });
 
 ipcMain.handle('collect-url', async (_event, url) => {
-  const win = new BrowserWindow({ show: true, width: 1100, height: 800, webPreferences: { javascript: true } });
+  if (!isOzonHttpsUrl(url)) {
+    throw new Error('仅允许采集 ozon.ru 商品页');
+  }
+  const win = new BrowserWindow({
+    show: true,
+    width: 1100,
+    height: 800,
+    webPreferences: hardenedWebPrefs,
+  });
+  win.webContents.on('will-navigate', (event, next) => {
+    if (!isOzonHttpsUrl(next)) {
+      event.preventDefault();
+    }
+  });
   try {
     await win.loadURL(url);
     await new Promise((resolve) => setTimeout(resolve, 2500));
@@ -36,7 +76,7 @@ ipcMain.handle('collect-url', async (_event, url) => {
 
 function extract() {
   const name = (document.querySelector('h1') && document.querySelector('h1').textContent.trim()) || '';
-  const sku = (location.pathname.match(/(\\d{6,})/) || [])[1] || String(Date.now());
+  const sku = (location.pathname.match(/(\d{6,})/) || [])[1] || String(Date.now());
   const title = document.title || '';
   const visible = document.body && document.body.innerText ? document.body.innerText.slice(0, 4000) : '';
   const challenge = /доступ ограничен|подтвердите[\s\S]{0,40}не робот|are you a robot|just a moment/i.test(

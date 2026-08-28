@@ -8,6 +8,7 @@ import { CrawlerService } from './crawler.service';
 import { HeartbeatDto } from './dto/heartbeat.dto';
 import { AgentProductDto, AgentResultDto, AgentListingDto, ClaimTaskDto } from './dto/agent-result.dto';
 import { StandardProduct } from '@aiecom/shared';
+import { CaptchaDetectedError, CollectFailedError } from '@aiecom/collector-core';
 
 function toStandardProduct(dto: AgentProductDto): StandardProduct {
   const specs = [...(dto.specs ?? [])];
@@ -99,10 +100,25 @@ export class CollectorGatewayController {
       if (!dto.product) {
         throw new BadRequestException('成功回传必须包含 product');
       }
-      await this.crawlerService.ingestSuccess(itemId, requireTenantId(tenantId), toStandardProduct(dto.product));
+      await this.crawlerService.ingestSuccess(itemId, requireTenantId(tenantId), toStandardProduct(dto.product), {
+        agentKey: dto.agentKey,
+      });
       return { ok: true };
     }
-    await this.crawlerService.ingestFailure(itemId, requireTenantId(tenantId), new Error(dto.error || '采集端回传失败'));
+    await this.crawlerService.ingestFailure(
+      itemId,
+      requireTenantId(tenantId),
+      toAgentFailure(dto),
+      { agentKey: dto.agentKey },
+    );
     return { ok: true };
   }
+}
+
+function toAgentFailure(dto: AgentResultDto) {
+  const message = dto.error || '采集端回传失败';
+  if (dto.failCode === 'CAPTCHA_DETECTED' || /验证码|captcha|не робот|robot/i.test(message)) {
+    return new CaptchaDetectedError(message);
+  }
+  return new CollectFailedError(dto.failCode || 'COLLECT_FAILED', message);
 }

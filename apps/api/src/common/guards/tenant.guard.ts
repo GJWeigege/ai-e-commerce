@@ -1,14 +1,18 @@
-import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
+import { CanActivate, ExecutionContext, ForbiddenException, Injectable } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { IS_PUBLIC_KEY, SKIP_TENANT_KEY } from '../decorators/auth.decorators';
+import { PrismaService } from '../prisma/prisma.service';
 import { resolveRequestTenantId } from '../tenant/tenant-scope';
 import { AuthUser } from '../../modules/auth/auth.types';
 
 @Injectable()
 export class TenantGuard implements CanActivate {
-  constructor(private readonly reflector: Reflector) {}
+  constructor(
+    private readonly reflector: Reflector,
+    private readonly prisma: PrismaService,
+  ) {}
 
-  canActivate(context: ExecutionContext): boolean {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
       context.getHandler(),
       context.getClass(),
@@ -40,11 +44,21 @@ export class TenantGuard implements CanActivate {
       return true;
     }
 
-    request.tenantId = resolveRequestTenantId({
+    const tenantId = resolveRequestTenantId({
       userTenantId: user.tenantId,
       isSuperAdmin: user.roles.includes('SUPER_ADMIN'),
       headerTenantId,
     });
+    if (tenantId) {
+      const tenant = await this.prisma.tenant.findUnique({
+        where: { id: tenantId },
+        select: { status: true },
+      });
+      if (!tenant || tenant.status !== 'ACTIVE') {
+        throw new ForbiddenException('租户不存在或已停用');
+      }
+    }
+    request.tenantId = tenantId;
     return true;
   }
 }
