@@ -161,6 +161,27 @@ describe('wb listing mapper', () => {
     });
   });
 
+  it('does not treat clothing letter Размер as warehouse package', () => {
+    expect(mapWbDimensions([{ name: 'Размер', value: 'M' }])).toEqual({});
+    expect(mapWbDimensions([], { description: 'Размер: 10*22 см/20*40 см' })).toEqual({});
+  });
+
+  it('maps physical Размер 2D plus thickness and description Вес to warehouse package', () => {
+    expect(
+      mapWbDimensions([
+        { name: 'Размер', value: '10*22 см/20*40 см' },
+        { name: 'Толщина', value: 'около 0,5 мм' },
+      ]),
+    ).toEqual({
+      length: 40,
+      width: 20,
+      height: 1,
+    });
+    expect(mapWbDimensions([{ name: 'Вес', value: '30 г' }])).toEqual({
+      weightBrutto: 0.13,
+    });
+  });
+
   it('parses combined package габариты without inventing weight', () => {
     expect(
       mapWbDimensions([{ name: 'Габариты товара', value: '200x150x50 мм' }]),
@@ -194,6 +215,45 @@ describe('wb listing mapper', () => {
 
   it('uses a single large size in the title as package length', () => {
     expect(mapWbDimensions([], { name: 'Швабра для пола 120 см' }).length).toBeGreaterThanOrEqual(120);
+  });
+
+  it('does not let marketing 40cm in the title override ozon package 211x46x24mm', () => {
+    expect(
+      mapWbDimensions(
+        [
+          { name: 'Длина, мм', value: '211' },
+          { name: 'Ширина, мм', value: '46' },
+          { name: 'Высота, мм', value: '24' },
+          { name: 'Вес товара, г', value: '49' },
+        ],
+        { name: 'Портативная электрогрелка 40cm', description: 'нагреватель 40x20 см кабель 120cm' },
+      ),
+    ).toEqual({
+      length: 22,
+      width: 5,
+      height: 3,
+      weightBrutto: 0.15,
+    });
+  });
+
+  it('does not let PDP Габариты 10*22 см override logistics 211x46x24mm', () => {
+    expect(
+      mapWbDimensions(
+        [
+          { name: 'Длина, мм', value: '211' },
+          { name: 'Ширина, мм', value: '46' },
+          { name: 'Высота, мм', value: '24' },
+          { name: 'Вес товара, г', value: '49' },
+          { name: 'Габариты', value: '10*22 см' },
+        ],
+        { name: 'Портативная электрогрелка', description: 'Размер: 10*22 см/20*40 см' },
+      ),
+    ).toEqual({
+      length: 22,
+      width: 5,
+      height: 3,
+      weightBrutto: 0.15,
+    });
   });
 
   it('creates one WB size per sku option and maps color/brand characteristics', () => {

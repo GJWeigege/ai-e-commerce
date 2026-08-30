@@ -142,7 +142,15 @@ function normalizeKey(value: string): string {
     .trim();
 }
 
-function isApparelSizeName(name: string): boolean {
+function looksLikePhysicalPackageSize(value: string): boolean {
+  const text = String(value || '');
+  return /[xх×*]/.test(text) && /(см|mm|мм|cm)(?![a-zа-яё])/i.test(text) && (text.match(/\d+/g) || []).length >= 2;
+}
+
+function isApparelSizeName(name: string, value = ''): boolean {
+  if (looksLikePhysicalPackageSize(value)) {
+    return false;
+  }
   const keyNorm = normalizeKey(name).replace(/\./g, ' ').replace(/\s+/g, ' ').trim();
   if (APPAREL_SIZE_KEYS.some((alias) => keyNorm.includes(alias.replace(/\./g, ' ')))) {
     return true;
@@ -224,34 +232,43 @@ export function mapPackageDimensions(
     });
   }
 
-  for (const spec of rows) {
-    if (isApparelSizeName(spec.name) && !looksLikeCombinedSize(spec.value)) {
-      continue;
+  const hasNamedSize = Boolean(found.length && found.width && found.height);
+  if (!hasNamedSize) {
+    for (const spec of rows) {
+      if (isApparelSizeName(spec.name, spec.value)) {
+        continue;
+      }
+      const combined = parseCombinedSize(`${spec.name} ${spec.value}`);
+      if (!combined) {
+        continue;
+      }
+      found.length = Math.max(found.length, combined.length);
+      found.width = Math.max(found.width, combined.width);
+      found.height = Math.max(found.height, combined.height);
     }
-    const combined = parseCombinedSize(`${spec.name} ${spec.value}`);
-    if (!combined) {
-      continue;
-    }
-    found.length = Math.max(found.length, combined.length);
-    found.width = Math.max(found.width, combined.width);
-    found.height = Math.max(found.height, combined.height);
   }
 
   const blob = [source?.name, source?.description, ...(source?.skuOptions || []).map((item) => item.name || '')]
     .filter(Boolean)
     .join(' ');
-  const fromText = parseCombinedSize(blob);
-  if (fromText) {
-    found.length = Math.max(found.length, fromText.length);
-    found.width = Math.max(found.width, fromText.width);
-    found.height = Math.max(found.height, fromText.height);
+  const hasCompleteSize = Boolean(found.length && found.width && found.height);
+  const looksLikeVariantSizes = /\d+(?:[.,]\d+)?\s*[xх×*]\s*\d+(?:[.,]\d+)?\s*(?:мм|mm|см|cm)?\s*\/\s*\d+/i.test(blob);
+  if (!hasCompleteSize && !looksLikeVariantSizes) {
+    const fromText = parseCombinedSize(blob);
+    if (fromText) {
+      found.length = Math.max(found.length, fromText.length);
+      found.width = Math.max(found.width, fromText.width);
+      found.height = Math.max(found.height, fromText.height);
+    }
+    found.length = Math.max(found.length, parseLongestEdgeFromText(blob));
   }
-  const textWeight = parseWeightFromText(blob);
-  if (textWeight) {
-    found.weightBrutto = Math.max(found.weightBrutto, textWeight);
-    productWeight = Math.max(productWeight, textWeight);
+  if (!found.weightBrutto && !productWeight) {
+    const textWeight = parseWeightFromText(blob);
+    if (textWeight) {
+      found.weightBrutto = textWeight;
+      productWeight = textWeight;
+    }
   }
-  found.length = Math.max(found.length, parseLongestEdgeFromText(blob));
 
   let weightKg = 0;
   if (productWeight > 0) {

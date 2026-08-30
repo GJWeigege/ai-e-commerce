@@ -10,7 +10,7 @@ import {
 } from '@aiecom/collector-core';
 import { detectCaptchaOrBlock } from '@aiecom/collector-core';
 import { withRetry, CaptchaDetectedError } from '@aiecom/collector-core';
-import { extractOzonProductFromHtml, buildSkuOptions } from '@aiecom/collector-core';
+import { extractOzonProductFromHtml, buildSkuOptions, parseOzonWidgetPage, parseLabeledDescriptionSpecs, warehouseSpecsFromCharacteristics } from '@aiecom/collector-core';
 import { buildOzonCategoryListingUrl, extractOzonProductUrls, isOzonListingUrl, pickOzonProductUrls, toAllowedCollectUrl } from '@aiecom/collector-core';
 import { alignSkuOptions, combineFamilyListings, fillSkuOptionsFromVariants, inferWeightOption, isSameOzonFamily, keepMainSkuOnly, ozonListingSlugFamily, productFamilyKey } from '@aiecom/shared';
 import { scoreProduct } from '@aiecom/llm-core';
@@ -355,6 +355,359 @@ describe('ozon html extract', () => {
     expect(fromBlob.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '800')).toBe(true);
   });
 
+  it('reads ozon tracking dimension string and grams like seerfar 211x46x24mm / 49g', () => {
+    const product = extractOzonProductFromHtml(
+      `<html><head><script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product',
+        sku: '2974096117',
+        name: 'Портативная электрогрелка 40cm',
+        offers: { price: 990 },
+      })}</script><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webSale-1': JSON.stringify({
+            cellTrackingInfo: {
+              product: {
+                id: 2974096117,
+                sku: 2974096117,
+                title: 'Портативная электрогрелка',
+                original: 1290,
+                price: 990,
+                dimension: '211x46x24',
+                weight: 49,
+              },
+            },
+          }),
+        },
+      })}</script></head><body><h1>Портативная электрогрелка</h1></body></html>`,
+      'https://www.ozon.ru/product/portativnaya-elektrogrelka-2974096117/',
+    );
+    expect(product.specs?.some((item) => item.name === 'Длина, мм' && item.value === '211')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Ширина, мм' && item.value === '46')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Высота, мм' && item.value === '24')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '49')).toBe(true);
+  });
+
+  it('keeps tracking 211x46x24mm even when the PDP also has marketing Габариты 10*22 см', () => {
+    const product = extractOzonProductFromHtml(
+      `<html><head><script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product',
+        sku: '2974096117',
+        name: 'Портативная электрогрелка',
+        offers: { price: 990 },
+      })}</script><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webSale-1': JSON.stringify({
+            cellTrackingInfo: {
+              product: {
+                id: 2974096117,
+                sku: 2974096117,
+                dimension: '211x46x24',
+                weight: 49,
+              },
+            },
+          }),
+          'webShortCharacteristics-1': JSON.stringify({
+            short: [{ title: 'Габариты', values: [{ text: '10*22 см' }] }],
+          }),
+        },
+      })}</script></head><body><h1>Портативная электрогрелка</h1><p>Размер: 10*22 см/20*40 см</p></body></html>`,
+      'https://www.ozon.ru/product/portativnaya-elektrogrelka-2974096117/',
+    );
+    expect(product.specs?.some((item) => item.name === 'Длина, мм' && item.value === '211')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '49')).toBe(true);
+  });
+
+  it('reads ozon textRs characteristic rows for mm size and grams', () => {
+    const product = extractOzonProductFromHtml(
+      `<html><head><script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product',
+        sku: '2974096117',
+        name: 'Портативная электрогрелка',
+        offers: { price: 990 },
+      })}</script><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webCharacteristics-31-pdpPage2column': JSON.stringify({
+            characteristics: [
+              {
+                title: { textRs: [{ type: 'text', content: 'Длина, мм' }] },
+                values: [{ text: '211' }],
+              },
+              {
+                title: { textRs: [{ type: 'text', content: 'Ширина, мм' }] },
+                values: [{ text: '46' }],
+              },
+              {
+                title: { textRs: [{ type: 'text', content: 'Высота, мм' }] },
+                values: [{ text: '24' }],
+              },
+              {
+                title: { textRs: [{ type: 'text', content: 'Вес товара, г' }] },
+                values: [{ text: '49' }],
+              },
+            ],
+          }),
+        },
+      })}</script></head><body><h1>Портативная электрогрелка</h1></body></html>`,
+      'https://www.ozon.ru/product/portativnaya-elektrogrelka-2974096117/',
+    );
+    expect(product.specs?.some((item) => item.name === 'Длина, мм' && item.value === '211')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Ширина, мм' && item.value === '46')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Высота, мм' && item.value === '24')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '49')).toBe(true);
+  });
+
+  it('captures nested dimensions, page-2 long params and delivery widgets', () => {
+    const nested = extractOzonProductFromHtml(
+      `<html><head><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webPdp-1': JSON.stringify({
+            sku: '777888999',
+            dimensions: { width: 180, depth: 250, height: 60 },
+            weight: 800,
+          }),
+        },
+      })}</script></head><body><h1>Box</h1></body></html>`,
+      'https://www.ozon.ru/product/box-777888999/',
+    );
+    expect(nested.specs?.some((item) => item.name === 'Длина, мм' && item.value === '250')).toBe(true);
+    expect(nested.specs?.some((item) => item.name === 'Ширина, мм' && item.value === '180')).toBe(true);
+    expect(nested.specs?.some((item) => item.name === 'Высота, мм' && item.value === '60')).toBe(true);
+    expect(nested.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '800')).toBe(true);
+
+    const page2 = extractOzonProductFromHtml(
+      `<html><head><script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product',
+        sku: '4115958654',
+        name: 'Коврик',
+        offers: { price: 390 },
+      })}</script><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webCharacteristics-31-pdpPage2column': JSON.stringify({
+            characteristics: [
+              {
+                title: 'Габариты',
+                long: [
+                  { name: 'Длина, мм', values: [{ text: '400' }] },
+                  { name: 'Ширина, мм', values: [{ text: '300' }] },
+                  { name: 'Высота, мм', values: [{ text: '20' }] },
+                  { name: 'Вес товара, г', values: [{ text: '450' }] },
+                ],
+              },
+            ],
+          }),
+        },
+      })}</script></head><body><h1>Коврик</h1></body></html>`,
+      'https://www.ozon.ru/product/kovrik-4115958654/',
+    );
+    expect(page2.specs?.some((item) => item.name === 'Длина, мм' && item.value === '400')).toBe(true);
+    expect(page2.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '450')).toBe(true);
+
+    const delivery = extractOzonProductFromHtml(
+      `<html><head><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webDelivery-1': JSON.stringify({
+            sku: '3400831917',
+            dimensions: { length: 120, width: 80, height: 40 },
+            weight: 350,
+          }),
+        },
+      })}</script></head><body><h1>Filter</h1></body></html>`,
+      'https://www.ozon.ru/product/filter-3400831917/',
+    );
+    expect(delivery.specs?.some((item) => item.name === 'Длина, мм' && item.value === '120')).toBe(true);
+    expect(delivery.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '350')).toBe(true);
+  });
+
+  it('reads long/short characteristic objects, unicode-escaped widgets, volume string and Вес, г', () => {
+    const grouped = extractOzonProductFromHtml(
+      `<html><head><script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product',
+        sku: '2974096117',
+        name: 'Грелка',
+        offers: { price: 990 },
+      })}</script><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webCharacteristics-1': JSON.stringify({
+            characteristics: {
+              short: [{ title: 'Цвет', values: [{ text: 'Черный' }] }],
+              long: [
+                { title: { textRs: [{ content: 'Длина упаковки, мм' }] }, values: [{ text: '211' }] },
+                { title: { textRs: [{ content: 'Ширина, мм' }] }, values: [{ text: '46' }] },
+                { title: { textRs: [{ content: 'Высота, мм' }] }, values: [{ text: '24' }] },
+                { title: { textRs: [{ content: 'Вес, г' }] }, values: [{ text: '49' }] },
+              ],
+            },
+          }),
+        },
+      })}</script></head><body><h1>Грелка</h1></body></html>`,
+      'https://www.ozon.ru/product/grelka-2974096117/',
+    );
+    expect(grouped.specs?.some((item) => item.name === 'Длина упаковки, мм' && item.value === '211')).toBe(true);
+    expect(grouped.specs?.some((item) => item.name === 'Вес, г' && item.value === '49')).toBe(true);
+
+    const unicodeWidget =
+      '{"cellTrackingInfo":{"product":{"sku":2974096117,"dimension":"211x46x24","weight":49}},"characteristics":[{"title":"\\u0414\\u043b\\u0438\\u043d\\u0430, \\u043c\\u043c","values":[{"text":"211"}]},{"title":"\\u0412\\u0435\\u0441, \\u0433","values":[{"text":"49"}]}]}';
+    const unicode = extractOzonProductFromHtml(
+      `<html><head><script type="application/json">${JSON.stringify({
+        widgetStates: { 'webSale-1': unicodeWidget },
+      })}</script></head><body><h1>Грелка</h1></body></html>`,
+      'https://www.ozon.ru/product/grelka-2974096117/',
+    );
+    expect(unicode.specs?.some((item) => item.name === 'Длина, мм' && item.value === '211')).toBe(true);
+    expect(unicode.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '49')).toBe(true);
+
+    const volume = extractOzonProductFromHtml(
+      `<html><head><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webPdp-1': JSON.stringify({ sku: '2974096117', volume: '211x46x24', weight: '49 г' }),
+        },
+      })}</script></head><body><h1>Грелка</h1></body></html>`,
+      'https://www.ozon.ru/product/grelka-2974096117/',
+    );
+    expect(volume.specs?.some((item) => item.name === 'Длина, мм' && item.value === '211')).toBe(true);
+    expect(volume.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '49')).toBe(true);
+  });
+
+  it('parses webShortCharacteristics textRs into warehouse weight and size', () => {
+    const parsed = parseOzonWidgetPage({
+      widgetStates: {
+        'webShortCharacteristics-1-default-1': JSON.stringify({
+          characteristics: [
+            { title: { textRs: [{ text: 'Бренд' }] }, values: [{ text: 'Samsung' }] },
+            { title: { textRs: [{ text: 'Вес' }] }, values: [{ text: '1.5 кг' }] },
+            { title: { textRs: [{ text: 'Размеры' }] }, values: [{ text: '20 × 30 × 10 см' }] },
+            { title: { textRs: [{ text: 'Материал' }] }, values: [{ text: 'Пластик' }] },
+          ],
+        }),
+        'webPrice-3121879-default-1': JSON.stringify({ cardPrice: '53 022 ₽' }),
+      },
+    });
+    expect(parsed.specs).toEqual(
+      expect.arrayContaining([
+        { name: 'Бренд', value: 'Samsung' },
+        { name: 'Вес', value: '1.5 кг' },
+        { name: 'Размеры', value: '20 × 30 × 10 см' },
+        { name: 'Материал', value: 'Пластик' },
+      ]),
+    );
+    expect(parsed.warehouse).toEqual(
+      expect.arrayContaining([
+        { name: 'Длина, мм', value: '200' },
+        { name: 'Ширина, мм', value: '300' },
+        { name: 'Высота, мм', value: '100' },
+        { name: 'Вес товара, г', value: '1500' },
+      ]),
+    );
+    expect(warehouseSpecsFromCharacteristics([{ name: 'Вес, кг', value: '4.5' }])).toEqual([
+      { name: 'Вес товара, г', value: '4500' },
+    ]);
+
+    const html = extractOzonProductFromHtml(
+      `<html><head><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webShortCharacteristics-9-pdpPage2column-2': JSON.stringify({
+            characteristics: [
+              { title: { textRs: [{ content: 'Вес, кг' }] }, values: [{ text: '4.5' }] },
+              { title: { textRs: [{ content: 'Размеры' }] }, values: [{ text: '20 × 30 × 10 см' }] },
+            ],
+          }),
+        },
+      })}</script></head><body><h1>Acer</h1></body></html>`,
+      'https://www.ozon.ru/product/acer-5494720969/',
+    );
+    expect(html.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '4500')).toBe(true);
+    expect(html.specs?.some((item) => item.name === 'Длина, мм' && item.value === '200')).toBe(true);
+  });
+
+  it('parses page-2 webCharacteristics nested short rows (Acer laptop live shape)', () => {
+    const parsed = parseOzonWidgetPage({
+      widgetStates: {
+        'webCharacteristics-3282540-pdpPage2column-2': JSON.stringify({
+          totalCount: 58,
+          characteristics: [
+            {
+              short: [
+                { key: 'CPUName', name: 'Процессор', values: [{ text: 'Intel Core i9-14900HX' }] },
+                { key: 'MaxWeight', name: 'Вес, кг', values: [{ text: '4.5' }] },
+                { key: 'Brand', name: 'Бренд', values: [{ text: 'Acer' }] },
+                { key: 'Resolution', name: 'Разрешение экрана', values: [{ text: '2560x1600' }] },
+              ],
+            },
+          ],
+        }),
+      },
+    });
+    expect(parsed.specs).toEqual(
+      expect.arrayContaining([
+        { name: 'Процессор', value: 'Intel Core i9-14900HX' },
+        { name: 'Вес, кг', value: '4.5' },
+        { name: 'Бренд', value: 'Acer' },
+      ]),
+    );
+    expect(parsed.warehouse).toEqual([{ name: 'Вес товара, г', value: '4500' }]);
+    expect(parsed.specs.some((item) => item.name === 'Длина, мм')).toBe(false);
+  });
+
+  it('reads description labeled fields as specs without treating Размер as warehouse package', () => {
+    const product = extractOzonProductFromHtml(
+      `<html><head><script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product',
+        sku: '2974096117',
+        name: 'Портативная электрогрелка',
+        description: 'Цвет: черный\nМатериал: углеродное волокно\nТемпература: 60-70 °\nРазмер: 10*22 см/20*40 см',
+        offers: { price: 990 },
+      })}</script></head><body><h1>Портативная электрогрелка</h1></body></html>`,
+      'https://www.ozon.ru/product/portativnaya-elektrogrelka-2974096117/',
+    );
+    expect(product.specs?.some((item) => item.name === 'Материал' && /углерод/i.test(item.value))).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Размер' && /10/.test(item.value))).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Габариты')).toBe(false);
+  });
+
+  it('maps heater description Размер plus thickness, and labeled Вес: 30 г, to warehouse specs', () => {
+    expect(
+      warehouseSpecsFromCharacteristics([
+        { name: 'Толщина', value: 'около 0,5 мм' },
+        { name: 'Размер', value: '10*22 см/20*40 см' },
+      ]),
+    ).toEqual([
+      { name: 'Длина, мм', value: '400' },
+      { name: 'Ширина, мм', value: '200' },
+      { name: 'Высота, мм', value: '1' },
+    ]);
+    expect(warehouseSpecsFromCharacteristics([{ name: 'Вес', value: '30 г' }])).toEqual([
+      { name: 'Вес товара, г', value: '30' },
+    ]);
+
+    const heater = extractOzonProductFromHtml(
+      `<html><head><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webDescription-1-pdpPage2column-2': JSON.stringify({
+            richAnnotation:
+              'Описание:\nНебольшой размер и легкий вес, портативный.\nСпецификация:\nТолщина: около 0,5 мм\nРазмер: 10*22 см/20*40 см\n',
+          }),
+        },
+      })}</script></head><body><h1>Портативная электрогрелка</h1></body></html>`,
+      'https://www.ozon.ru/product/portativnaya-elektrogrelka-2974096117/',
+    );
+    expect(heater.specs?.some((item) => item.name === 'Длина, мм' && item.value === '400')).toBe(true);
+    expect(heater.specs?.some((item) => item.name === 'Ширина, мм' && item.value === '200')).toBe(true);
+    expect(heater.specs?.some((item) => item.name === 'Высота, мм' && item.value === '1')).toBe(true);
+    expect(heater.specs?.some((item) => item.name === 'Вес товара, г')).toBe(false);
+
+    const white = extractOzonProductFromHtml(
+      `<html><head><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webDescription-1-pdpPage2column-2': JSON.stringify({
+            richAnnotation: 'Цвет: белый\nРазмер: S (8,5 см x 14 см),L (8,5 см x 19 см)\nВес: 30 г\nМатериал: углеродное волокно',
+          }),
+        },
+      })}</script></head><body><h1>Портативная электрогрелка</h1></body></html>`,
+      'https://www.ozon.ru/product/portativnaya-elektrogrelka-2975064358/',
+    );
+    expect(white.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '30')).toBe(true);
+  });
+
   it('collects original, discount and card prices plus JSON-LD brand', () => {
     const html = `
       <html>
@@ -516,6 +869,19 @@ describe('ozon html extract', () => {
                   { src: 'https://ir.ozone.ru/s3/multimedia-1-y/wc1200/dicer-side.jpg' },
                 ],
               }),
+              'catalogMenu-185-default-1': JSON.stringify({
+                categories: [
+                  {
+                    title: 'Одежда',
+                    image: 'https://ir.ozone.ru/s3/multimedia-1/wc1200/dress-category.jpg',
+                    url: '/category/odezhda/',
+                  },
+                  {
+                    title: 'Электроника',
+                    image: 'https://ir.ozone.ru/s3/searchteam-cdn/electro.png',
+                  },
+                ],
+              }),
               'tileGridDesktop-recommend-1': JSON.stringify({
                 items: [
                   {
@@ -541,8 +907,98 @@ describe('ozon html extract', () => {
       'https://www.ozon.ru/product/nasadka-dlya-narezki-kubikami-6-mm-3492958110/',
     );
     expect(product.imageUrls?.some((url) => /dicer-cover|dicer-side|dicer-main/i.test(url))).toBe(true);
-    expect(product.imageUrls?.some((url) => /slicer-other|mop-other|container-other|recommend-bottom/i.test(url))).toBe(
-      false,
+    expect(
+      product.imageUrls?.some((url) =>
+        /slicer-other|mop-other|container-other|recommend-bottom|dress-category|searchteam-cdn|electro/i.test(url),
+      ),
+    ).toBe(false);
+  });
+
+  it('does not take warehouse size or weight from recommendation tiles', () => {
+    const product = extractOzonProductFromHtml(
+      `<html><head><script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product',
+        sku: '2974096117',
+        name: 'Портативная электрогрелка',
+        offers: { price: 990 },
+      })}</script><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webGallery-pdp-1': JSON.stringify({
+            sku: 2974096117,
+            images: [{ src: 'https://ir.ozone.ru/s3/multimedia-1/wc1200/heater-cover.jpg' }],
+          }),
+          'tileGridDesktop-recommend-1': JSON.stringify({
+            items: [
+              {
+                sku: 1111111111,
+                dimensions: { depth: 250, width: 100, height: 80, weight: 999 },
+                tileImage: { items: [{ image: { link: 'https://ir.ozone.ru/s3/multimedia-9/wc1200/other.jpg' } }] },
+              },
+            ],
+          }),
+          'webDescription-1': JSON.stringify({
+            richAnnotation: 'Спецификация:\nТолщина: около 0,5 мм\nРазмер: 10*22 см/20*40 см\n',
+          }),
+        },
+      })}</script></head><body><h1>Портативная электрогрелка</h1></body></html>`,
+      'https://www.ozon.ru/product/portativnaya-elektrogrelka-2974096117/',
+    );
+    expect(product.specs?.some((item) => item.name === 'Длина, мм' && item.value === '250')).toBe(false);
+    expect(product.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '999')).toBe(false);
+    expect(product.imageUrls?.some((url) => /other\.jpg/i.test(url))).toBe(false);
+    expect(product.specs?.some((item) => item.name === 'Длина, мм' && item.value === '400')).toBe(true);
+  });
+
+  it('keeps this-SKU tracking package when recommend tiles also have dimensions', () => {
+    const product = extractOzonProductFromHtml(
+      `<html><head><script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product',
+        sku: '2974096117',
+        name: 'Портативная электрогрелка',
+        offers: { price: 990 },
+      })}</script><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webSale-1': JSON.stringify({
+            cellTrackingInfo: {
+              product: {
+                sku: 2974096117,
+                dimension: '211x46x24',
+                weight: 49,
+              },
+            },
+          }),
+          'tileGridDesktop-recommend-1': JSON.stringify({
+            items: [
+              {
+                sku: 1111111111,
+                dimension: '250x100x80',
+                weight: 999,
+              },
+            ],
+          }),
+        },
+      })}</script></head><body><h1>Портативная электрогрелка</h1></body></html>`,
+      'https://www.ozon.ru/product/portativnaya-elektrogrelka-2974096117/',
+    );
+    expect(product.specs?.some((item) => item.name === 'Длина, мм' && item.value === '211')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Ширина, мм' && item.value === '46')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Высота, мм' && item.value === '24')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '49')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Длина, мм' && item.value === '250')).toBe(false);
+    expect(product.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '999')).toBe(false);
+  });
+
+  it('keeps Толщина / Размер / Вес as separate labeled specs', () => {
+    expect(
+      parseLabeledDescriptionSpecs(
+        'Описание:\nНебольшой размер.\nСпецификация:\nТолщина: около 0,5 мм\nРазмер: 10*22 см/20*40 см\nВес: 30 г\n',
+      ),
+    ).toEqual(
+      expect.arrayContaining([
+        { name: 'Толщина', value: 'около 0,5 мм' },
+        { name: 'Размер', value: '10*22 см/20*40 см' },
+        { name: 'Вес', value: '30 г' },
+      ]),
     );
   });
 
@@ -563,6 +1019,13 @@ describe('ozon html extract', () => {
                   { title: { text: 'Тип' }, values: [{ text: 'Открывалка' }] },
                   { name: { content: 'Цвет' }, values: [{ text: 'Черный' }, {}, { text: 'серый' }] },
                   { title: { text: 'Длина, см' }, values: ['26'] },
+                ],
+              }),
+              'webGallery-1': JSON.stringify({
+                images: [
+                  { src: '//ir.ozone.ru/s3/multimedia-1-z/wc750/1547167821-a.jpg' },
+                  { src: 'https://ir-3.ozone.ru/s3/multimedia-1-y/c600/1547167821-b.jpg' },
+                  { src: 'https://ir.ozone.ru/s3/multimedia-1-x/wc1200/1547167821-c.jpg' },
                 ],
               }),
             },
@@ -600,6 +1063,16 @@ describe('ozon html extract', () => {
             name: 'Боул из нержавеющей стали с крышкой Pragma Sopdol, 5 л',
             offers: { price: 116 },
             image: ['https://ir-20.ozonstatic.cn/s3/multimedia-1-z/wc140/10326875500.jpg'],
+          })}</script>
+          <script type="application/json">${JSON.stringify({
+            widgetStates: {
+              'webGallery-1': JSON.stringify({
+                images: [
+                  { src: 'https://ir-20.ozonstatic.cn/s3/multimedia-1-y/wc140/10326875542.jpg' },
+                  { src: 'https://ir-20.ozonstatic.cn/s3/multimedia-1-e/wc1200/10326876242.jpg' },
+                ],
+              }),
+            },
           })}</script>
         </head>
         <body>

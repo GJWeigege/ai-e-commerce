@@ -77,7 +77,7 @@ function normalizeImage(raw) {
 
 function isGalleryImage(url) {
   if (!url) return false;
-  if (/\/cms\/|\/graphics\/|\/icons?\/|\/static\/|\/promo\/|\/bonus\/|\/marketing-api\/|\/banners?\//i.test(url)) return false;
+  if (/\/cms\/|\/graphics\/|\/icons?\/|\/static\/|\/promo\/|\/bonus\/|\/marketing-api\/|\/banners?\/|searchteam-cdn/i.test(url)) return false;
   if (/(?:^|[/-])(?:logo|icon|badge|banner|sprite|avatar|favicon|payment|flame)(?:[/-]|\.|$)/i.test(url)) return false;
   return /\/s3\/(?:multimedia|rp-photo)/i.test(url) || /\/multimedia(?:-\w+)?\//i.test(url);
 }
@@ -291,24 +291,15 @@ function walk(node, visit, depth) {
 }
 
 function isRecommendWidgetKey(key) {
-  return /tileGrid|skuGrid|recommend|similar|alsoBuy|boughtTogether|webList|collection|related/i.test(String(key || ''));
+  return /tileGrid|skuGrid|recommend|similar|alsoBuy|boughtTogether|webList|collection|related|catalogMenu|tapTags|horizontalMenu|bigPromo/i.test(
+    String(key || ''),
+  );
 }
 
 function isPdpGalleryWidgetKey(key) {
   if (isRecommendWidgetKey(key)) return false;
   const name = String(key || '').split('-')[0];
-  if (/^webGallery/i.test(name)) return true;
-  if (/^(galleryMobile|pdpGallery|webProductGallery|webPhotoGallery|productGallery)$/i.test(name)) return true;
-  return /gallery/i.test(name) && !/tile|grid|list/i.test(name);
-}
-
-function isGalleryShapedWidget(raw, skuId) {
-  if (!raw || typeof raw !== 'object' || raw.tileImage || raw.mainState) return false;
-  if (Array.isArray(raw.items) && raw.items.some((item) => item && (item.tileImage || item.mainState))) return false;
-  const hasList = Array.isArray(raw.images) || Array.isArray(raw.media) || Array.isArray(raw.photos);
-  if (!hasList) return false;
-  if (raw.sku != null && skuId && String(raw.sku) !== String(skuId)) return false;
-  return Boolean(raw.coverImage) || Boolean(raw.sku) || (Array.isArray(raw.images) && raw.images.length >= 2);
+  return /^(webGallery|galleryMobile|pdpGallery|webProductGallery|webPhotoGallery|productGallery)$/i.test(name);
 }
 
 function collectGalleryWidgetUrls(raw, urls) {
@@ -332,7 +323,7 @@ function collectGalleryFromTrees(trees, urls, skuId) {
       if (isRecommendWidgetKey(key)) return;
       let widget = states[key];
       if (typeof widget === 'string') widget = parseJson(widget);
-      if (!isPdpGalleryWidgetKey(key) && !isGalleryShapedWidget(widget, skuId)) return;
+      if (!isPdpGalleryWidgetKey(key)) return;
       collectGalleryWidgetUrls(widget, urls);
     });
   });
@@ -389,11 +380,13 @@ function specLabel(raw) {
   if (Array.isArray(raw)) return raw.map(specLabel).filter(Boolean).join(', ');
   if (typeof raw !== 'object') return '';
   return specLabel(
-    raw.text ||
+      raw.text ||
       raw.content ||
       raw.textRs ||
+      raw.textAtom ||
       raw.contentRS ||
       raw.valueRs ||
+      raw.titleRs ||
       raw.title ||
       raw.value ||
       raw.name ||
@@ -403,10 +396,30 @@ function specLabel(raw) {
   );
 }
 
+function asCharRows(raw, depth) {
+  if (!raw || (depth || 0) > 5) return [];
+  if (Array.isArray(raw)) return raw.flatMap((item) => asCharRows(item, (depth || 0) + 1));
+  if (typeof raw !== 'object') return [];
+  const nested = []
+    .concat(Array.isArray(raw.long) ? raw.long : [])
+    .concat(Array.isArray(raw.short) ? raw.short : [])
+    .concat(Array.isArray(raw.all) ? raw.all : [])
+    .concat(Array.isArray(raw.characteristics) ? raw.characteristics : [])
+    .concat(Array.isArray(raw.items) ? raw.items : [])
+    .concat(Array.isArray(raw.groups) ? raw.groups : [])
+    .concat(Array.isArray(raw.sections) ? raw.sections : []);
+  if (nested.length) return nested.flatMap((item) => asCharRows(item, (depth || 0) + 1));
+  if (raw.title || raw.name || raw.key || raw.titleRs || raw.value || raw.valueRs || raw.contentRS || raw.values) {
+    return [raw];
+  }
+  return [];
+}
+
 function addSpec(specs, name, value) {
   const n = specLabel(name);
   const v = specLabel(value);
-  if (!n || !v || n === '[object Object]' || v === '[object Object]' || n.length > 80 || v.length > 800 || n === '商品描述') return;
+  if (!n || !v || n === '[object Object]' || v === '[object Object]' || n.length > 80 || v.length > 800) return;
+  if (/^(Длина, мм|Ширина, мм|Высота, мм|Вес товара, г)$/.test(n) && specs.some((item) => item.name === n)) return;
   if (specs.some((item) => item.name === n && item.value === v)) return;
   specs.push({ name: n, value: v });
 }
@@ -431,6 +444,7 @@ function extract(payload) {
     if (page) trees.push(page);
   });
   const extraImageUrls = Array.isArray(payload.extraImageUrls) ? payload.extraImageUrls : [];
+  const dimSpecs = Array.isArray(payload.dimSpecs) ? payload.dimSpecs : [];
 
   const name =
     jsonLd.name ||
@@ -530,13 +544,21 @@ function extract(payload) {
           }
         }
         const charRows = []
-          .concat(obj.characteristics || [])
-          .concat(obj.shortCharacteristics || [])
-          .concat(obj.characteristicsList || [])
-          .concat(obj.fullCharacteristics || [])
-          .concat(obj.descriptionCharacteristics || [])
-          .concat(obj.productCharacteristics || [])
-          .concat(obj.attrs || []);
+          .concat(asCharRows(obj.characteristics))
+          .concat(asCharRows(obj.shortCharacteristics))
+          .concat(asCharRows(obj.characteristicsList))
+          .concat(asCharRows(obj.fullCharacteristics))
+          .concat(asCharRows(obj.descriptionCharacteristics))
+          .concat(asCharRows(obj.productCharacteristics))
+          .concat(asCharRows(obj.attrs))
+          .concat(asCharRows(obj.long))
+          .concat(asCharRows(obj.short))
+          .concat(asCharRows(obj.all))
+          .concat(asCharRows(obj.params))
+          .concat(asCharRows(obj.properties))
+          .concat(asCharRows(obj.groups))
+          .concat(asCharRows(obj.sections))
+          .concat(asCharRows(obj.blocks));
         charRows.forEach((row) => {
           const title = row && (row.title || row.name || row.key);
           const values =
@@ -550,16 +572,46 @@ function extract(payload) {
                   : row.value);
           addSpec(specs, title, Array.isArray(values) ? values.map(specLabel).filter(Boolean).join(', ') : values);
         });
-        if (!obj.src && !obj.original && obj.depth != null && obj.width != null && obj.height != null) {
-          const depth = Number(obj.depth);
-          const width = Number(obj.width);
-          const height = Number(obj.height);
-          const weight = Number(obj.weight);
+        const dimNested = obj.dimensions && typeof obj.dimensions === 'object' ? obj.dimensions : null;
+        const dimSrc = dimNested || obj;
+        const looksLikeMedia =
+          obj.dimension == null &&
+          obj.weight == null &&
+          !obj.dimensions &&
+          ((typeof obj.src === 'string' && /^https?:\/\//i.test(obj.src)) ||
+            (typeof obj.original === 'string' && /^https?:\/\//i.test(obj.original)) ||
+            (typeof obj.srcset === 'string' && obj.srcset) ||
+            (typeof obj.previewUrl === 'string' && /^https?:\/\//i.test(obj.previewUrl)));
+        if (!looksLikeMedia) {
+          const dimText = [obj.dimension, typeof obj.dimensions === 'string' ? obj.dimensions : '', obj.packageSize, obj.volume]
+            .map((item) => String(item || '').replace(/,/g, '.').replace(/\s+/g, '').trim())
+            .find((item) => /^\d+(?:\.\d+)?[xх×*]\d+(?:\.\d+)?[xх×*]\d+(?:\.\d+)?/i.test(item));
+          const dimMatch = dimText
+            ? dimText.match(/^(\d+(?:\.\d+)?)[xх×*](\d+(?:\.\d+)?)[xх×*](\d+(?:\.\d+)?)(?:мм|mm|см|cm)?$/i)
+            : null;
+          const asCm = dimText && /см|cm/i.test(String(obj.dimension || obj.dimensions || '')) && !/мм|mm/i.test(String(obj.dimension || obj.dimensions || ''));
+          const fromString = dimMatch
+            ? {
+                depth: Number(dimMatch[1]) * (asCm ? 10 : 1),
+                width: Number(dimMatch[2]) * (asCm ? 10 : 1),
+                height: Number(dimMatch[3]) * (asCm ? 10 : 1),
+              }
+            : null;
+          const depth = fromString
+            ? fromString.depth
+            : Number(dimSrc.depth != null ? dimSrc.depth : dimSrc.length != null ? dimSrc.length : obj.depth != null ? obj.depth : obj.length);
+          const width = fromString ? fromString.width : Number(dimSrc.width != null ? dimSrc.width : obj.width);
+          const height = fromString ? fromString.height : Number(dimSrc.height != null ? dimSrc.height : obj.height);
+          const rawWeight = dimSrc.weight != null ? dimSrc.weight : obj.weight != null ? obj.weight : obj.weightGrams;
+          let weight = Number(rawWeight);
+          if (isFinite(weight) && weight > 0 && weight < 80 && weight % 1 !== 0) weight = Math.round(weight * 1000);
           if ([depth, width, height].every((item) => isFinite(item) && item > 0 && item < 5000)) {
             addSpec(specs, 'Длина, мм', String(Math.round(depth)));
             addSpec(specs, 'Ширина, мм', String(Math.round(width)));
             addSpec(specs, 'Высота, мм', String(Math.round(height)));
             if (isFinite(weight) && weight > 0 && weight < 100000) addSpec(specs, 'Вес товара, г', String(Math.round(weight)));
+          } else if (fromString && isFinite(weight) && weight > 0 && weight < 100000) {
+            addSpec(specs, 'Вес товара, г', String(Math.round(weight)));
           }
         }
         if (
@@ -588,6 +640,8 @@ function extract(payload) {
       0,
     );
   });
+
+  dimSpecs.forEach((item) => addSpec(specs, item && item.name, item && item.value));
 
   collectGalleryFromTrees(trees, urls, sku);
   document
@@ -675,29 +729,65 @@ function extract(payload) {
     : []
   ).forEach((item) => addSpec(specs, item && item.name, item && item.value));
   document
-    .querySelectorAll('[data-widget="webCharacteristics"] dt, [data-widget="webShortCharacteristics"] dt')
+    .querySelectorAll(
+      '[data-widget="webCharacteristics"] dt, [data-widget="webShortCharacteristics"] dt, #section-characteristics dt',
+    )
     .forEach((dt) => addSpec(specs, dt.textContent, dt.nextElementSibling && dt.nextElementSibling.textContent));
   document
-    .querySelectorAll('[data-widget="webCharacteristics"] tr, [data-widget="webShortCharacteristics"] tr')
+    .querySelectorAll('[data-widget="webCharacteristics"] tr, [data-widget="webShortCharacteristics"] tr, #section-characteristics tr')
     .forEach((tr) => {
       const cells = tr.querySelectorAll('td, th');
       if (cells.length >= 2) addSpec(specs, cells[0].textContent, cells[1].textContent);
     });
+  const sellerNode = document.querySelector('[data-widget="webCurrentSeller"]');
+  if (sellerNode) {
+    const seller = String(sellerNode.innerText || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .split(/[•|]/)[0]
+      .trim();
+    if (seller) addSpec(specs, 'Продавец', seller.slice(0, 80));
+  }
+  const brandNode = document.querySelector('[data-widget="webBrand"]');
+  if (brandNode && !brand) {
+    brand = String(brandNode.innerText || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .split(/[•|]/)[0]
+      .trim();
+  }
 
   const descNode = document.querySelector(
-    '[data-widget="webDescription"], [data-widget="webProductDescription"], [itemprop="description"]',
+    '#section-description, [data-widget="webDescription"], [data-widget="webProductDescription"], [itemprop="description"]',
   );
   if (descNode && descNode.innerText && descNode.innerText.trim().length > description.length) {
-    description = descNode.innerText.replace(/\s+/g, ' ').trim().slice(0, 8000);
+    description = descNode.innerText.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, 8000);
   }
-  const hasDimSpec = specs.some((item) =>
+  const labeled = [];
+  const labeledRe = /(?:^|[\n;；])\s*([A-Za-zА-ЯЁа-яё][^:\n]{0,40}?)\s*[:：][^\S\n]*/g;
+  const descText = String(description || '').replace(/\\n/g, '\n');
+  let labeledMatch;
+  while ((labeledMatch = labeledRe.exec(descText))) {
+    labeled.push({ name: labeledMatch[1].trim(), start: labeledMatch.index, valueStart: labeledMatch.index + labeledMatch[0].length });
+  }
+  labeled.forEach((item, i) => {
+    const value = descText
+      .slice(item.valueStart, labeled[i + 1] ? labeled[i + 1].start : descText.length)
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (item.name && value) addSpec(specs, item.name, value);
+  });
+  const hasLogisticsSize = specs.some((item) => item.name === 'Длина, мм') &&
+    specs.some((item) => item.name === 'Ширина, мм') &&
+    specs.some((item) => item.name === 'Высота, мм');
+  const hasDimSpec = hasLogisticsSize || specs.some((item) =>
     /длина|ширина|высота|глубина|габарит|вес товара|вес брутто|вес с упаков|length|width|height|weight/i.test(item.name),
   );
   if (!hasDimSpec) {
     const sizeMatch = [name, description]
       .filter(Boolean)
       .join(' ')
-      .match(/(\d+(?:[.,]\d+)?)\s*[xх×*]\s*(\d+(?:[.,]\d+)?)(?:\s*[xх×*]\s*(\d+(?:[.,]\d+)?))?\s*(мм|mm|см|cm)/i);
+      .match(/(\d+(?:[.,]\d+)?)\s*[xх×*]\s*(\d+(?:[.,]\d+)?)\s*[xх×*]\s*(\d+(?:[.,]\d+)?)\s*(мм|mm|см|cm)/i);
     if (sizeMatch) addSpec(specs, 'Габариты', sizeMatch[0].replace(/\s+/g, ' ').trim());
   }
   if (description) addSpec(specs, '商品描述', description.slice(0, 4000));
@@ -761,12 +851,20 @@ function extract(payload) {
 }
 
 async function fetchComposerPages() {
-  const path = (location.pathname || '/').replace(/\/?$/, '/');
   const origin = location.origin || 'https://www.ozon.ru';
-  const api = origin + '/api/composer-api.bx/page/json/v2?url=';
+  const sku = (location.pathname.match(/(\d{6,})/) || [null, ''])[1];
+  if (!sku) return [];
+  const path = (location.pathname.endsWith('/') ? location.pathname : location.pathname + '/') || '/product/' + sku + '/';
+  const entry = origin + '/api/entrypoint-api.bx/page/json/v2?url=';
+  const qs = new URLSearchParams(String(location.search || '').replace(/^\?/, ''));
+  qs.set('oos_search', 'false');
+  const page2 = new URLSearchParams(qs.toString());
+  page2.set('layout_container', 'pdpPage2column');
+  page2.set('layout_page_index', '2');
   const urls = [
-    api + encodeURIComponent(path),
-    api + encodeURIComponent(path + '?layout_container=pdpPage2column&layout_page_index=2'),
+    entry + encodeURIComponent(path + '?' + qs.toString()),
+    entry + encodeURIComponent(path + '?' + page2.toString()),
+    entry + encodeURIComponent('/modal/size-table?product_id=' + sku + '&page_changed=true'),
   ];
   const pages = [];
   for (let i = 0; i < urls.length; i += 1) {
@@ -774,7 +872,7 @@ async function fetchComposerPages() {
       const res = await fetch(urls[i], { credentials: 'include', headers: { accept: 'application/json' } });
       if (!res.ok) continue;
       const json = await res.json();
-      if (json) pages.push(json);
+      if (json && !json.incidentId) pages.push(json);
     } catch (_e) {
       /* isolated-world fetch is blocked by CORS on some Chrome versions */
     }
@@ -787,10 +885,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const run = async () => {
     if (isListingLocation()) return extractListing(message.limit || 80);
     const payload = {
-      composerPages: Array.isArray(message.composerPages) ? message.composerPages : [],
+      dimSpecs: Array.isArray(message.dimSpecs) ? message.dimSpecs : [],
       extraImageUrls: Array.isArray(message.extraImageUrls) ? message.extraImageUrls : [],
+      composerPages: [],
     };
-    if (!payload.composerPages.length) {
+    if (!payload.dimSpecs.length || !payload.extraImageUrls.length) {
       payload.composerPages = await fetchComposerPages();
     }
     return extract(payload);

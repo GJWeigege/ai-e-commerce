@@ -7,3 +7,4 @@ export * from './csv';
 export * from './ozon-urls';
 export * from './listing-quota';
 export * from './ozon-html-extract';
+export * from './ozon-widget-parse';

@@ -102,124 +102,146 @@ function ozonProductPath(tabUrl) {
   }
 }
 
+function emptyHarvest(error) {
+  return { dimSpecs: [], imgUrls: [], fetches: [], error: error || '', pageCount: 0, debug: [], charNames: [], meta: {} };
+}
+
+function isProductGalleryUrl(url) {
+  const value = String(url || '');
+  if (!value) return false;
+  if (
+    /\/cms\/|\/graphics\/|\/icons?\/|\/static\/|\/promo\/|\/bonus\/|\/marketing-api\/|\/banners?\/|searchteam-cdn|favicon|sprite|logo/i.test(
+      value,
+    )
+  ) {
+    return false;
+  }
+  if (/(?:^|[/-])(?:logo|icon|badge|banner|sprite|avatar|favicon|payment|flame)(?:[/-]|\.|$)/i.test(value)) {
+    return false;
+  }
+  return /\/s3\/(?:multimedia|rp-photo)/i.test(value) || /\/multimedia(?:-\w+)?\//i.test(value);
+}
+
+function mergeHarvest(product, harvest) {
+  product = mergeDimSpecs(product, harvest && harvest.dimSpecs);
+  if (!product || product.kind === 'listing' || !harvest) {
+    return product;
+  }
+  const meta = harvest.meta && typeof harvest.meta === 'object' ? harvest.meta : {};
+  if (meta.brand && !product.brand) product.brand = meta.brand;
+  if (meta.description && (!product.description || product.description.length < String(meta.description).length)) {
+    product.description = meta.description;
+  }
+  if (meta.rating && !product.rating) product.rating = meta.rating;
+  if (meta.reviewCount && !product.reviewCount) product.reviewCount = meta.reviewCount;
+  if (meta.categoryPath && !product.categoryPath) product.categoryPath = meta.categoryPath;
+  if (meta.originalPrice && !product.originalPrice) product.originalPrice = meta.originalPrice;
+  if (meta.discountPrice && !product.discountPrice) product.discountPrice = meta.discountPrice;
+  if (meta.price && (!product.price || product.price <= 0)) product.price = meta.price;
+  if (Array.isArray(meta.videoUrls) && meta.videoUrls.length) {
+    product.videoUrls = (product.videoUrls || [])
+      .concat(meta.videoUrls)
+      .filter((url, index, arr) => url && arr.indexOf(url) === index)
+      .slice(0, 8);
+  }
+  const harvested = (Array.isArray(harvest.imgUrls) ? harvest.imgUrls : []).filter(isProductGalleryUrl);
+  const existing = (product.imageUrls || []).filter(isProductGalleryUrl);
+  const seen = {};
+  product.imageUrls = (harvested.length ? harvested.concat(existing) : existing).filter((url) => {
+    if (!url || seen[url]) return false;
+    seen[url] = true;
+    return true;
+  }).slice(0, 30);
+  if (product.imageUrls[0] && (!product.mainImageUrl || !isProductGalleryUrl(product.mainImageUrl))) {
+    product.mainImageUrl = product.imageUrls[0];
+  }
+  return product;
+}
+
+function mergeDimSpecs(product, dimSpecs) {
+  if (!product || product.kind === 'listing' || !Array.isArray(dimSpecs) || !dimSpecs.length) {
+    return product;
+  }
+  product.specs = Array.isArray(product.specs) ? product.specs : [];
+  dimSpecs
+    .slice()
+    .reverse()
+    .forEach((spec) => {
+      const name = String((spec && spec.name) || '').trim();
+      const value = String((spec && spec.value) || '').trim();
+      if (!name || !value) return;
+      const idx = product.specs.findIndex((item) => item.name === name);
+      if (idx >= 0) product.specs[idx] = { name, value };
+      else product.specs.unshift({ name, value });
+    });
+  return product;
+}
+
 async function harvestOzonComposer(tabId, tabUrl) {
   if (!/\/product\//i.test(tabUrl) || isListingUrl(tabUrl)) {
-    return { pages: [], imgUrls: [] };
+    return emptyHarvest();
   }
   try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      files: ['ozon-harvest.js'],
+    });
     const injected = await Promise.race([
       chrome.scripting.executeScript({
         target: { tabId },
         world: 'MAIN',
         args: [ozonProductPath(tabUrl), String(tabUrl).match(/(\d{6,})\/?(?:[?#]|$)/)?.[1] || ''],
         func: async (productPath, pageSku) => {
-          const origin = location.origin || 'https://www.ozon.ru';
-          const api = origin + '/api/composer-api.bx/page/json/v2?url=';
-          const paths = [productPath, productPath.replace(/\/$/, '')].filter(
-            (item, index, arr) => item && arr.indexOf(item) === index,
-          );
-          const pageUrls = paths.map((path) => api + encodeURIComponent(path));
-          const imgUrls = [];
-          function pushMaybe(value) {
-            if (typeof value === 'string' && value) imgUrls.push(value);
-            else if (value && typeof value === 'object') {
-              if (typeof value.url === 'string') imgUrls.push(value.url);
-              if (typeof value.link === 'string') imgUrls.push(value.link);
-              if (typeof value.src === 'string') imgUrls.push(value.src);
+          try {
+            if (typeof window.__aiecomHarvestOzon !== 'function') {
+              return { dimSpecs: [], imgUrls: [], fetches: [], error: 'harvest helper missing', pageCount: 0, debug: [], charNames: [], meta: {} };
             }
-          }
-          function isRecommendWidgetKey(key) {
-            return /tileGrid|skuGrid|recommend|similar|alsoBuy|boughtTogether|webList|collection|related/i.test(
-              String(key || ''),
-            );
-          }
-          function isPdpGalleryWidgetKey(key) {
-            if (isRecommendWidgetKey(key)) return false;
-            const name = String(key || '').split('-')[0];
-            if (/^webGallery/i.test(name)) return true;
-            if (/^(galleryMobile|pdpGallery|webProductGallery|webPhotoGallery|productGallery)$/i.test(name)) return true;
-            return /gallery/i.test(name) && !/tile|grid|list/i.test(name);
-          }
-          function isGalleryShapedWidget(widget) {
-            if (!widget || typeof widget !== 'object' || widget.tileImage || widget.mainState) {
-              return false;
+            const report = await window.__aiecomHarvestOzon(productPath, pageSku);
+            if (!report || typeof report !== 'object') {
+              return { dimSpecs: [], imgUrls: [], fetches: [], error: 'harvest returned ' + String(report), pageCount: 0, debug: [], charNames: [], meta: {} };
             }
-            if (Array.isArray(widget.items) && widget.items.some((item) => item && (item.tileImage || item.mainState))) {
-              return false;
-            }
-            const hasList = Array.isArray(widget.images) || Array.isArray(widget.media) || Array.isArray(widget.photos);
-            if (!hasList) return false;
-            if (widget.sku != null && pageSku && String(widget.sku) !== String(pageSku)) return false;
-            return Boolean(widget.coverImage) || Boolean(widget.sku) || (Array.isArray(widget.images) && widget.images.length >= 2);
+            return JSON.parse(JSON.stringify(report));
+          } catch (error) {
+            return {
+              dimSpecs: [],
+              imgUrls: [],
+              fetches: [],
+              error: String(error && error.message ? error.message : error),
+              pageCount: 0,
+              debug: [],
+              charNames: [],
+              meta: {},
+            };
           }
-          function urlsFromGallery(json) {
-            const ws = json && json.widgetStates;
-            if (!ws || typeof ws !== 'object') return;
-            Object.keys(ws).forEach((key) => {
-              if (isRecommendWidgetKey(key)) return;
-              let widget = ws[key];
-              if (typeof widget === 'string') {
-                try {
-                  widget = JSON.parse(widget);
-                } catch (_e) {
-                  return;
-                }
-              }
-              if (!isPdpGalleryWidgetKey(key) && !isGalleryShapedWidget(widget)) return;
-              if (!widget || typeof widget !== 'object' || widget.tileImage || widget.mainState) return;
-              pushMaybe(widget.coverImage);
-              [].concat(widget.images || [], widget.media || [], widget.photos || []).forEach((item) => {
-                if (typeof item === 'string') {
-                  imgUrls.push(item);
-                  return;
-                }
-                if (!item || typeof item !== 'object') return;
-                ['src', 'url', 'original', 'image', 'link', 'file_name'].forEach((field) => pushMaybe(item[field]));
-              });
-            });
-          }
-          for (const pageUrl of pageUrls) {
-            try {
-              const res = await fetch(pageUrl, {
-                credentials: 'include',
-                headers: { accept: 'application/json' },
-              });
-              if (!res.ok) continue;
-              const text = await res.text();
-              try {
-                urlsFromGallery(JSON.parse(text));
-              } catch (_e) {
-                /* not json */
-              }
-              if (imgUrls.length) break;
-            } catch (_e) {
-              /* antibot / network */
-            }
-          }
-          document
-            .querySelectorAll(
-              '[data-widget*="webGallery"], [data-widget="galleryMobile"], [data-widget="pdpGallery"], [data-widget="webProductGallery"], [id*="webGallery"], [id*="state-webGallery"]',
-            )
-            .forEach((root) => {
-              root.querySelectorAll('img').forEach((el) => {
-                imgUrls.push(el.currentSrc || el.src || '');
-              });
-            });
-          return { imgUrls: imgUrls.filter(Boolean).slice(0, 40) };
         },
       }),
       new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('composer timeout')), 15000);
+        setTimeout(() => reject(new Error('composer timeout')), 45000);
       }),
     ]);
     const result = injected && injected[0] && injected[0].result;
-    if (result && Array.isArray(result.imgUrls)) {
-      return { pages: [], imgUrls: result.imgUrls.filter(Boolean) };
+    if (injected && injected[0] && injected[0].error) {
+      return emptyHarvest(String(injected[0].error.message || injected[0].error));
     }
-  } catch (_e) {
-    /* MAIN-world harvest is best-effort; content.js still extracts the DOM */
+    if (result) {
+      return {
+        dimSpecs: Array.isArray(result.dimSpecs) ? result.dimSpecs.filter((item) => item && item.name && item.value) : [],
+        imgUrls: Array.isArray(result.imgUrls) ? result.imgUrls.filter(Boolean) : [],
+        fetches: Array.isArray(result.fetches) ? result.fetches : [],
+        error: String(result.error || ''),
+        pageCount: Number(result.pageCount) || 0,
+        debug: Array.isArray(result.debug) ? result.debug.slice(0, 12) : [],
+        charNames: Array.isArray(result.charNames) ? result.charNames.slice(0, 80) : [],
+        meta: result.meta && typeof result.meta === 'object' ? result.meta : {},
+      };
+    }
+    return emptyHarvest(
+      'empty harvest result: frames=' + (Array.isArray(injected) ? injected.length : typeof injected),
+    );
+  } catch (error) {
+    return emptyHarvest(String(error && error.message ? error.message : error));
   }
-  return { pages: [], imgUrls: [] };
 }
 
 async function extractTab(tabId, limit) {
@@ -228,20 +250,37 @@ async function extractTab(tabId, limit) {
     throw new Error('仅允许采集 ozon.ru 页面');
   }
   const harvest = await harvestOzonComposer(tabId, String(tab.url || ''));
+  await chrome.storage.local.set({
+    lastHarvest: {
+      at: Date.now(),
+      skuId: String(tab.url || '').match(/(\d{6,})\/?(?:[?#]|$)/)?.[1] || '',
+      dimSpecs: harvest.dimSpecs,
+      fetches: harvest.fetches,
+      pageCount: harvest.pageCount,
+      error: harvest.error,
+      debug: harvest.debug || [],
+      charNames: harvest.charNames || [],
+      meta: harvest.meta || {},
+      imgCount: Array.isArray(harvest.imgUrls) ? harvest.imgUrls.length : 0,
+    },
+  });
   const message = {
     type: 'EXTRACT',
     limit: Number(limit) > 0 ? Number(limit) : 80,
-    composerPages: harvest.pages,
+    dimSpecs: harvest.dimSpecs,
     extraImageUrls: harvest.imgUrls,
   };
+  let result;
   try {
-    const result = await chrome.tabs.sendMessage(tabId, message);
-    if (result) return result;
+    result = await chrome.tabs.sendMessage(tabId, message);
   } catch (_e) {
     /* content script may not be injected yet */
   }
-  await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
-  return chrome.tabs.sendMessage(tabId, message);
+  if (!result) {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    result = await chrome.tabs.sendMessage(tabId, message);
+  }
+  return mergeHarvest(result, harvest);
 }
 
 function isUsableProduct(product) {
@@ -649,10 +688,18 @@ async function ingestCurrentTab(tabId) {
       crawlAllSkus: false,
     }),
   });
+  const harvest = await chrome.storage.local.get({ lastHarvest: null });
+  const harvestInfo = harvest.lastHarvest || null;
   await chrome.storage.local.set({
-    lastIngest: { at: Date.now(), ok: true, skuId: product.skuId, data },
+    lastIngest: {
+      at: Date.now(),
+      ok: true,
+      skuId: product.skuId,
+      data,
+      harvest: harvestInfo,
+    },
   });
-  return data;
+  return { data, harvest: harvestInfo };
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -676,12 +723,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === 'INGEST_TAB') {
     ingestCurrentTab(message.tabId)
-      .then((data) => sendResponse({ ok: true, data }))
+      .then((payload) => sendResponse({ ok: true, data: payload.data, harvest: payload.harvest }))
       .catch((error) => {
-        chrome.storage.local.set({
-          lastIngest: { at: Date.now(), ok: false, error: error.message },
+        chrome.storage.local.get({ lastHarvest: null }).then((stored) => {
+          chrome.storage.local.set({
+            lastIngest: { at: Date.now(), ok: false, error: error.message, harvest: stored.lastHarvest || null },
+          });
+          sendResponse({ ok: false, error: error.message, harvest: stored.lastHarvest || null });
         });
-        sendResponse({ ok: false, error: error.message });
       });
     return true;
   }

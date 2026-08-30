@@ -28,11 +28,8 @@ async function bootstrap() {
   );
   app.enableCors({
     origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
-      if (isAllowedCorsOrigin(origin)) {
-        callback(null, true);
-        return;
-      }
-      callback(new Error('Not allowed by CORS'));
+      // 拒绝时不要 throw：cors 抛错会变成 500，Chrome 插件即使有 host_permissions 也会被服务端直接掐掉。
+      callback(null, isAllowedCorsOrigin(origin));
     },
     credentials: true,
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Tenant-Id'],

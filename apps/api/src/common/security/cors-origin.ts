@@ -13,8 +13,10 @@ export function allowedWebOrigins(env: NodeJS.ProcessEnv = process.env): string[
 
 /**
  * 浏览器 Origin 白名单。
- * 无 Origin 的请求（curl / 健康检查 / 已声明 host_permissions 的扩展 fetch）放行；
- * 生产环境不允许任意 chrome-extension://，需通过 CHROME_EXTENSION_IDS 点名。
+ * 无 Origin 的请求（curl / 健康检查）放行。
+ * Chrome 插件 service worker 的 fetch 会带 chrome-extension://<id>；
+ * 解压加载时 ID 会变，未配置 CHROME_EXTENSION_IDS 时放行全部扩展 Origin（接口仍要 JWT）。
+ * 配了 CHROME_EXTENSION_IDS 则只放行名单内的 ID。
  */
 export function isAllowedCorsOrigin(origin: string | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
   if (!origin) {
@@ -32,7 +34,7 @@ export function isAllowedCorsOrigin(origin: string | undefined, env: NodeJS.Proc
     if (allowIds.length > 0) {
       return allowIds.includes(extensionId);
     }
-    return env.NODE_ENV !== 'production';
+    return Boolean(extensionId);
   }
   return false;
 }

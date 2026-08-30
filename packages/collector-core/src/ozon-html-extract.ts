@@ -12,6 +12,12 @@ import {
   StandardProduct,
 } from '@aiecom/shared';
 
+import {
+  parseLabeledDescriptionSpecs,
+  parseOzonWidgetPage,
+  warehouseSpecsFromCharacteristics,
+} from './ozon-widget-parse';
+
 const IMAGE_SIZE_DIR = /\/(?:wc|wcs|c)\d+\//i;
 
 function unescapeHtmlBlob(html: string): string {
@@ -89,7 +95,7 @@ export function isProductGalleryImage(raw: string): boolean {
   if (!url) {
     return false;
   }
-  if (/\/cms\/|\/graphics\/|\/icons?\/|\/static\/|\/promo\/|\/bonus\/|\/marketing-api\/|\/banners?\//i.test(url)) {
+  if (/\/cms\/|\/graphics\/|\/icons?\/|\/static\/|\/promo\/|\/bonus\/|\/marketing-api\/|\/banners?\/|searchteam-cdn/i.test(url)) {
     return false;
   }
   if (/(?:^|[/-])(?:logo|icon|badge|banner|sprite|avatar|favicon|payment|card-icon|flame)(?:[/-]|\.|$)/i.test(url)) {
@@ -229,6 +235,12 @@ function collectJsonTrees(html: string): unknown[] {
   return trees;
 }
 
+function isRecommendWidgetKey(key: string): boolean {
+  return /tileGrid|skuGrid|recommend|similar|alsoBuy|boughtTogether|webList|collection|related|catalogMenu|tapTags|horizontalMenu|bigPromo/i.test(
+    String(key || ''),
+  );
+}
+
 function walkJson(node: unknown, visit: (obj: Record<string, unknown>) => void, depth = 0): void {
   if (depth > 18 || node == null) {
     return;
@@ -252,7 +264,12 @@ function walkJson(node: unknown, visit: (obj: Record<string, unknown>) => void, 
     return;
   }
   visit(rec);
-  Object.values(rec).forEach((value) => walkJson(value, visit, depth + 1));
+  Object.entries(rec).forEach(([key, value]) => {
+    if (isRecommendWidgetKey(key)) {
+      return;
+    }
+    walkJson(value, visit, depth + 1);
+  });
 }
 
 function parseJsonLdProducts(html: string): Record<string, unknown>[] {
@@ -320,12 +337,14 @@ function collectDlSpecs(html: string): ProductSpec[] {
   return specs;
 }
 
+const WAREHOUSE_SPEC_NAMES = new Set(['Длина, мм', 'Ширина, мм', 'Высота, мм', 'Вес товара, г']);
+
 function mergeSpecs(groups: ProductSpec[][]): ProductSpec[] {
   const seen = new Set<string>();
   const out: ProductSpec[] = [];
   for (const group of groups) {
     for (const spec of group) {
-      const key = `${spec.name}=${spec.value}`;
+      const key = WAREHOUSE_SPEC_NAMES.has(spec.name) ? spec.name : `${spec.name}=${spec.value}`;
       if (seen.has(key) || spec.name === '商品描述' || spec.name === '[object Object]') {
         continue;
       }
@@ -416,42 +435,24 @@ function imageUrlsFromUnknown(raw: unknown, depth = 0): string[] {
   return keys.flatMap((key) => imageUrlsFromUnknown(rec[key], depth + 1));
 }
 
-function isRecommendWidgetKey(key: string): boolean {
-  return /tileGrid|skuGrid|recommend|similar|alsoBuy|boughtTogether|webList|collection|related/i.test(
-    String(key || ''),
-  );
-}
-
 function isPdpGalleryWidgetKey(key: string): boolean {
   if (isRecommendWidgetKey(key)) {
     return false;
   }
   const name = String(key || '').split('-')[0];
-  if (/^webGallery/i.test(name)) {
-    return true;
-  }
-  if (/^(galleryMobile|pdpGallery|webProductGallery|webPhotoGallery|productGallery)$/i.test(name)) {
-    return true;
-  }
-  return /gallery/i.test(name) && !/tile|grid|list/i.test(name);
+  return /^(webGallery|galleryMobile|pdpGallery|webProductGallery|webPhotoGallery|productGallery)$/i.test(name);
 }
 
-function isGalleryShapedWidget(raw: unknown, skuId = ''): boolean {
-  const rec = asRecord(raw);
-  if (!rec || rec.tileImage || rec.mainState) {
-    return false;
-  }
-  if (Array.isArray(rec.items) && rec.items.some((item) => asRecord(item)?.tileImage || asRecord(item)?.mainState)) {
-    return false;
-  }
-  const hasList = Array.isArray(rec.images) || Array.isArray(rec.media) || Array.isArray(rec.photos);
-  if (!hasList) {
-    return false;
-  }
-  if (rec.sku != null && skuId && String(rec.sku) !== String(skuId)) {
-    return false;
-  }
-  return Boolean(rec.coverImage) || Boolean(rec.sku) || (Array.isArray(rec.images) && rec.images.length >= 2);
+function isTrustedDimWidgetKey(key: string): boolean {
+  return /webSale|webDelivery|webCharacteristics|webShortCharacteristics|webProductMainWidget|webDetailSKU|webPdp|webPrice/i.test(
+    String(key || ''),
+  );
+}
+
+function objectSku(obj: Record<string, unknown>): string {
+  const value = obj.sku ?? obj.skuId ?? obj.productId;
+  const match = String(value ?? '').match(/(\d{6,})/);
+  return match ? match[1] : '';
 }
 
 function collectImagesFromGalleryWidget(raw: unknown): string[] {
@@ -497,7 +498,7 @@ function collectGalleryImagesFromTree(trees: unknown[], html = '', skuId = ''): 
         continue;
       }
       const parsed = typeof value === 'string' ? parseJsonSafe(value) : value;
-      if (!isPdpGalleryWidgetKey(key) && !isGalleryShapedWidget(parsed, skuId)) {
+      if (!isPdpGalleryWidgetKey(key)) {
         continue;
       }
       urls.push(...collectImagesFromGalleryWidget(parsed));
@@ -520,17 +521,17 @@ function collectGalleryImagesFromTree(trees: unknown[], html = '', skuId = ''): 
   return urls;
 }
 
-function collectMultimediaUrlsFromBlob(blob: string): string[] {
+function collectImagesFromWebGalleryHtml(html: string): string[] {
   const urls: string[] = [];
-  const re =
-    /(?:https?:)?\/\/[a-z0-9.-]*ozon[a-z0-9.-]*\/s3\/(?:multimedia|rp-photo)[^"'\\\s<>]+/gi;
+  const startRe = /data-widget="[^"]*webGallery[^"]*"/gi;
   let match: RegExpExecArray | null;
-  while ((match = re.exec(blob)) !== null) {
-    urls.push(match[0].replace(/[\\,;.]+$/, ''));
-  }
-  const attrRe = /(?:src|data-src|data-original|data-lazy|srcset)=["']([^"']+)["']/gi;
-  while ((match = attrRe.exec(blob)) !== null) {
-    match[1].split(',').forEach((part) => urls.push(part.trim().split(/\s+/)[0]));
+  while ((match = startRe.exec(html)) !== null) {
+    const slice = html.slice(match.index, match.index + 8000);
+    const attrRe = /(?:src|data-src|data-original|data-lazy|srcset)=["']([^"']+)["']/gi;
+    let attr: RegExpExecArray | null;
+    while ((attr = attrRe.exec(slice)) !== null) {
+      attr[1].split(',').forEach((part) => urls.push(part.trim().split(/\s+/)[0]));
+    }
   }
   return urls;
 }
@@ -600,8 +601,10 @@ function textFromUnknown(raw: unknown, depth = 0): string {
     'text',
     'content',
     'textRs',
+    'textAtom',
     'contentRS',
     'valueRs',
+    'titleRs',
     'title',
     'value',
     'name',
@@ -1029,6 +1032,15 @@ const CHARACTERISTIC_ROW_KEYS = [
   'descriptionCharacteristics',
   'productCharacteristics',
   'attrs',
+  'long',
+  'short',
+  'params',
+  'properties',
+  'all',
+  'groups',
+  'sections',
+  'rows',
+  'blocks',
 ];
 
 function characteristicText(values: unknown): string {
@@ -1044,25 +1056,57 @@ function characteristicText(values: unknown): string {
     .join(', ');
 }
 
+function flattenCharacteristicRows(raw: unknown, depth = 0): Record<string, unknown>[] {
+  if (depth > 6 || raw == null) {
+    return [];
+  }
+  if (Array.isArray(raw)) {
+    return raw.flatMap((item) => flattenCharacteristicRows(item, depth + 1));
+  }
+  const rec = asRecord(raw);
+  if (!rec) {
+    return [];
+  }
+  const nested = [
+    rec.long,
+    rec.short,
+    rec.all,
+    rec.characteristics,
+    rec.items,
+    rec.groups,
+    rec.sections,
+    rec.rows,
+    rec.blocks,
+  ].flatMap((item) => (item && item !== rec ? flattenCharacteristicRows(item, depth + 1) : []));
+  const name = textFromUnknown(rec.title ?? rec.name ?? rec.key ?? rec.titleRs).trim();
+  const text = characteristicText(rec.values ?? rec.contentRS ?? rec.valueRs ?? rec.value)
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (name && text && name !== '[object Object]' && text !== '[object Object]') {
+    return [{ ...rec, __name: name, __value: text }, ...nested];
+  }
+  return nested;
+}
+
+function collectWidgetPageSpecs(trees: unknown[]): ProductSpec[] {
+  const specs: ProductSpec[] = [];
+  for (const tree of trees) {
+    const parsed = parseOzonWidgetPage(tree);
+    specs.push(...parsed.warehouse, ...parsed.specs);
+  }
+  return specs;
+}
+
 function collectCharacteristicsFromTree(trees: unknown[]): ProductSpec[] {
   const specs: ProductSpec[] = [];
   for (const tree of trees) {
     walkJson(tree, (obj) => {
       for (const key of CHARACTERISTIC_ROW_KEYS) {
-        const rows = obj[key];
-        if (!Array.isArray(rows)) {
-          continue;
-        }
-        for (const row of rows) {
-          const rec = asRecord(row);
-          if (!rec) {
-            continue;
-          }
-          const name = textFromUnknown(rec.title ?? rec.name ?? rec.key).trim();
-          const text = characteristicText(rec.values ?? rec.contentRS ?? rec.valueRs ?? rec.value)
-            .replace(/\s+/g, ' ')
-            .trim();
-          if (name && name !== '[object Object]' && text && text !== '[object Object]') {
+        const rows = flattenCharacteristicRows(obj[key]);
+        for (const rec of rows) {
+          const name = String(rec.__name || '').trim();
+          const text = String(rec.__value || '').trim();
+          if (name && text) {
             specs.push({ name, value: text });
           }
         }
@@ -1072,47 +1116,215 @@ function collectCharacteristicsFromTree(trees: unknown[]): ProductSpec[] {
   return specs;
 }
 
-function collectPackageDimsFromTree(trees: unknown[]): ProductSpec[] {
-  const specs: ProductSpec[] = [];
+function parseOzonDimensionString(raw: unknown): { depth: number; width: number; height: number } | null {
+  const text = String(raw ?? '')
+    .replace(/,/g, '.')
+    .replace(/\s+/g, '')
+    .trim();
+  const match = text.match(
+    /^(\d+(?:\.\d+)?)\s*[xх×*]\s*(\d+(?:\.\d+)?)(?:\s*[xх×*]\s*(\d+(?:\.\d+)?))?(?:мм|mm|см|cm)?$/i,
+  );
+  if (!match || !match[3]) {
+    return null;
+  }
+  const unit = /см|cm/i.test(String(raw ?? '')) && !/мм|mm/i.test(String(raw ?? '')) ? 'cm' : 'mm';
+  const toMm = (value: string) => {
+    const num = Number(value);
+    if (!Number.isFinite(num) || num <= 0) {
+      return 0;
+    }
+    return unit === 'cm' ? num * 10 : num;
+  };
+  const depth = toMm(match[1]);
+  const width = toMm(match[2]);
+  const height = toMm(match[3]);
+  if (![depth, width, height].every((item) => item > 0 && item < 5000)) {
+    return null;
+  }
+  return { depth, width, height };
+}
+
+function readPackageWeightGrams(raw: unknown): number {
+  if (typeof raw === 'string') {
+    const match = raw.replace(',', '.').match(/(\d+(?:\.\d+)?)\s*(кг|kg|г|g)?/i);
+    if (!match) {
+      return 0;
+    }
+    const num = Number(match[1]);
+    if (!Number.isFinite(num) || num <= 0) {
+      return 0;
+    }
+    if (match[2] && /кг|kg/i.test(match[2])) {
+      return Math.round(num * 1000);
+    }
+    return readPackageWeightGrams(num);
+  }
+  const weight = Number(raw);
+  if (!Number.isFinite(weight) || weight <= 0 || weight >= 100_000) {
+    return 0;
+  }
+  if (weight > 0 && weight < 80 && weight % 1 !== 0) {
+    return Math.round(weight * 1000);
+  }
+  return weight;
+}
+
+function isLikelyMediaUrl(raw: unknown): boolean {
+  return typeof raw === 'string' && (/^https?:\/\//i.test(raw) || /\.(jpg|jpeg|png|webp|gif|avif)(\?|$)/i.test(raw));
+}
+
+function isLikelyMediaObject(obj: Record<string, unknown>): boolean {
+  if (obj.dimension != null || obj.weight != null || obj.dimensions != null || obj.packageSize != null) {
+    return false;
+  }
+  return (
+    isLikelyMediaUrl(obj.src) ||
+    isLikelyMediaUrl(obj.original) ||
+    isLikelyMediaUrl(obj.srcset) ||
+    isLikelyMediaUrl(obj.previewUrl)
+  );
+}
+
+function readPackageDimBlob(obj: Record<string, unknown>): {
+  depth: number;
+  width: number;
+  height: number;
+  weight: number;
+} | null {
+  if (isLikelyMediaObject(obj)) {
+    return null;
+  }
+  const nested = asRecord(obj.dimensions);
+  const fromString =
+    parseOzonDimensionString(obj.dimension) ||
+    parseOzonDimensionString(typeof obj.dimensions === 'string' ? obj.dimensions : '') ||
+    parseOzonDimensionString(obj.packageSize) ||
+    parseOzonDimensionString(typeof obj.volume === 'string' ? obj.volume : '') ||
+    parseOzonDimensionString(nested && (nested.dimension || nested.value || nested.text));
+  const src = nested ?? obj;
+  const depth = fromString ? fromString.depth : Number(src.depth ?? src.length ?? obj.depth ?? obj.length);
+  const width = fromString ? fromString.width : Number(src.width ?? obj.width);
+  const height = fromString ? fromString.height : Number(src.height ?? obj.height);
+  const weight = readPackageWeightGrams(src.weight ?? obj.weight ?? obj.weightGrams ?? obj.packageWeight);
+  const hasEdges = [depth, width, height].every((item) => Number.isFinite(item) && item > 0 && item < 5000);
+  if (!hasEdges && !(weight > 0)) {
+    return null;
+  }
+  return {
+    depth: hasEdges ? depth : 0,
+    width: hasEdges ? width : 0,
+    height: hasEdges ? height : 0,
+    weight,
+  };
+}
+
+function walkJsonScoped(
+  node: unknown,
+  visit: (obj: Record<string, unknown>, sku: string) => void,
+  depth = 0,
+  ancestorSku = '',
+): void {
+  if (depth > 18 || node == null) {
+    return;
+  }
+  if (typeof node === 'string') {
+    const trimmed = node.trim();
+    if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && trimmed.length > 8) {
+      const parsed = parseJsonSafe(trimmed);
+      if (parsed) {
+        walkJsonScoped(parsed, visit, depth + 1, ancestorSku);
+      }
+    }
+    return;
+  }
+  if (Array.isArray(node)) {
+    node.forEach((item) => walkJsonScoped(item, visit, depth + 1, ancestorSku));
+    return;
+  }
+  const rec = asRecord(node);
+  if (!rec) {
+    return;
+  }
+  const sku = objectSku(rec) || ancestorSku;
+  visit(rec, sku);
+  Object.entries(rec).forEach(([key, value]) => {
+    if (isRecommendWidgetKey(key)) {
+      return;
+    }
+    walkJsonScoped(value, visit, depth + 1, sku);
+  });
+}
+
+function collectPackageDimsFromTree(trees: unknown[], pageSku = ''): ProductSpec[] {
+  const edges: Array<{ depth: number; width: number; height: number; score: number }> = [];
+  const weights: Array<{ weight: number; score: number }> = [];
+  const take = (obj: Record<string, unknown>, sku: string, allowUnscoped: boolean) => {
+    if (pageSku && sku && sku !== pageSku) {
+      return;
+    }
+    if (pageSku && !sku && !allowUnscoped) {
+      return;
+    }
+    const blob = readPackageDimBlob(obj);
+    if (!blob) {
+      return;
+    }
+    const score = pageSku && sku === pageSku ? 2 : 1;
+    if (blob.depth && blob.width && blob.height) {
+      edges.push({ depth: blob.depth, width: blob.width, height: blob.height, score });
+    }
+    if (blob.weight > 0) {
+      weights.push({ weight: blob.weight, score });
+    }
+  };
   for (const tree of trees) {
-    walkJson(tree, (obj) => {
-      if (obj.src || obj.original || obj.images || obj.srcset) {
-        return;
+    const rec = asRecord(tree);
+    const states = asRecord(rec?.widgetStates);
+    if (states) {
+      for (const [key, value] of Object.entries(states)) {
+        if (isRecommendWidgetKey(key)) {
+          continue;
+        }
+        const parsed = typeof value === 'string' ? parseJsonSafe(value) : value;
+        walkJsonScoped(parsed, (obj, sku) => take(obj, sku, isTrustedDimWidgetKey(key)));
       }
-      if (!('depth' in obj) || !('width' in obj) || !('height' in obj)) {
-        return;
-      }
-      const depth = Number(obj.depth ?? obj.length);
-      const width = Number(obj.width);
-      const height = Number(obj.height);
-      const weight = Number(obj.weight);
-      if (![depth, width, height].every((item) => Number.isFinite(item) && item > 0 && item < 5000)) {
-        return;
-      }
-      specs.push(
-        { name: 'Длина, мм', value: String(Math.round(depth)) },
-        { name: 'Ширина, мм', value: String(Math.round(width)) },
-        { name: 'Высота, мм', value: String(Math.round(height)) },
-      );
-      if (Number.isFinite(weight) && weight > 0 && weight < 100_000) {
-        specs.push({ name: 'Вес товара, г', value: String(Math.round(weight)) });
-      }
-    });
+      continue;
+    }
+    walkJsonScoped(tree, (obj, sku) => take(obj, sku, false));
+  }
+  const pick = <T extends { score: number }>(items: T[]): T | undefined =>
+    items.slice().sort((a, b) => b.score - a.score)[0];
+  const edge = pick(edges);
+  const weight = pick(weights);
+  const specs: ProductSpec[] = [];
+  if (edge) {
+    specs.push(
+      { name: 'Длина, мм', value: String(Math.round(edge.depth)) },
+      { name: 'Ширина, мм', value: String(Math.round(edge.width)) },
+      { name: 'Высота, мм', value: String(Math.round(edge.height)) },
+    );
+  }
+  if (weight) {
+    specs.push({ name: 'Вес товара, г', value: String(Math.round(weight.weight)) });
   }
   return specs;
 }
 
 function combinedSizeToken(text: string): string | null {
   const match = String(text || '').match(
-    /(\d+(?:[.,]\d+)?)\s*[xх×*]\s*(\d+(?:[.,]\d+)?)(?:\s*[xх×*]\s*(\d+(?:[.,]\d+)?))?\s*(мм|mm|см|cm)/i,
+    /(\d+(?:[.,]\d+)?)\s*[xх×*]\s*(\d+(?:[.,]\d+)?)\s*[xх×*]\s*(\d+(?:[.,]\d+)?)\s*(мм|mm|см|cm)/i,
   );
   return match ? match[0].replace(/\s+/g, ' ').trim() : null;
 }
 
 function hasDimensionSpec(specs: ProductSpec[]): boolean {
   return specs.some((item) =>
-    /длина|ширина|высота|глубина|габарит|вес товара|вес брутто|вес с упаков|length|width|height|weight/i.test(item.name),
+    /длина|ширина|высота|глубина|габарит|вес|length|width|height|weight/i.test(item.name),
   );
+}
+
+function collectLabeledDescriptionSpecs(description?: string): ProductSpec[] {
+  return parseLabeledDescriptionSpecs(description || '');
 }
 
 function enrichDimensionSpecs(specs: ProductSpec[], name?: string, description?: string): void {
@@ -1183,7 +1395,13 @@ function collectDescriptionFromTree(trees: unknown[]): string {
       for (const key of ['description', 'richAnnotation', 'text', 'html']) {
         const value = obj[key];
         if (typeof value === 'string') {
-          const text = stripTags(value);
+          const text = value
+            .replace(/<br\s*\/?>/gi, '\n')
+            .replace(/<\/(?:p|div|li|h\d)>/gi, '\n')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/[ \t]+\n/g, '\n')
+            .replace(/[ \t]{2,}/g, ' ')
+            .trim();
           if (text.length > best.length && text.length > 40) {
             best = text;
           }
@@ -1269,22 +1487,32 @@ export function extractOzonProductFromHtml(html: string, pageUrl: string): Parti
   const description =
     treeDescription || (typeof jsonLd.description === 'string' ? jsonLd.description.trim() : '') || undefined;
   const og = blob.match(/property=["']og:image["'][^>]*content=["']([^"']+)["']/i);
-  const fromGallery = collectGalleryImagesFromTree(trees, blob, skuId);
+  const fromGallery = [
+    ...collectGalleryImagesFromTree(trees, blob, skuId),
+    ...collectImagesFromWebGalleryHtml(html),
+  ];
   const fromLd = collectJsonLdImages(jsonLd);
   const gallery = uniqueOzonImages(
-    fromGallery.length
-      ? [...fromGallery, ...fromLd]
-      : [...fromLd, ...collectMultimediaUrlsFromBlob(blob), og?.[1]],
+    fromGallery.length ? [...fromGallery, ...fromLd] : [...fromLd, og?.[1]],
   );
   const imageUrls = gallery.length ? gallery : uniqueOzonImages([og?.[1]]);
   const treePrices = collectPricesFromTree(trees);
   const price = offerPrice(jsonLd) || treePrices.price;
   const specs = mergeSpecs([
-    collectPackageDimsFromTree(trees),
+    collectWidgetPageSpecs(trees),
+    collectPackageDimsFromTree(trees, skuId),
     collectCharacteristicsFromTree(trees),
+    collectLabeledDescriptionSpecs(description),
     collectJsonLdSpecs(jsonLd),
     collectDlSpecs(html),
   ]);
+  warehouseSpecsFromCharacteristics(specs)
+    .reverse()
+    .forEach((row) => {
+      if (!specs.some((item) => item.name === row.name)) {
+        specs.unshift(row);
+      }
+    });
   enrichDimensionSpecs(specs, name, description);
   if (description && !specs.some((item) => item.name === '商品描述')) {
     specs.push({ name: '商品描述', value: description.slice(0, 4000) });

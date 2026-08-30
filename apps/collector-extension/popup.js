@@ -54,8 +54,69 @@ async function ensureApiPermission(api) {
   }
 }
 
+function harvestSummary(harvest) {
+  if (!harvest) return '';
+  const warehouse = Array.isArray(harvest.dimSpecs)
+    ? harvest.dimSpecs.filter((item) => {
+        const name = String(item.name || '')
+          .toLowerCase()
+          .replace(/ё/g, 'е');
+        return /длина, мм|ширина, мм|высота, мм|вес товара|вес, кг|^вес$|^вес,|^масса/.test(name);
+      })
+    : [];
+  const others = Array.isArray(harvest.dimSpecs)
+    ? harvest.dimSpecs.filter((item) => {
+        const name = String(item.name || '')
+          .toLowerCase()
+          .replace(/ё/g, 'е');
+        return !/длина, мм|ширина, мм|высота, мм|вес товара|вес, кг|^вес$|^вес,|^масса/.test(name);
+      })
+    : [];
+  const dims = warehouse.map((item) => item.name + '=' + item.value).join(', ');
+  const extraSpecs = others
+    .slice(0, 24)
+    .map((item) => item.name + '=' + String(item.value).slice(0, 40))
+    .join(', ');
+  const fetches = Array.isArray(harvest.fetches)
+    ? harvest.fetches
+        .map((item) => {
+          const status = item.ok ? String(item.status) : String(item.status || 'err') + (item.error ? '/' + item.error : '');
+          const bytes = item.bytes ? ' ' + item.bytes + 'b' : '';
+          const widgets = item.widgets ? ' {' + String(item.widgets).slice(0, 80) + '}' : '';
+          return status + bytes + widgets;
+        })
+        .join('\n')
+    : '';
+  const chars = Array.isArray(harvest.charNames) && harvest.charNames.length ? harvest.charNames.join(', ') : '';
+  const meta = harvest.meta && typeof harvest.meta === 'object' ? harvest.meta : {};
+  const metaLine = [
+    meta.brand ? '品牌=' + meta.brand : '',
+    meta.sellerName ? '卖家=' + meta.sellerName : '',
+    meta.categoryPath ? '类目=' + String(meta.categoryPath).slice(0, 80) : '',
+    meta.description ? '描述=' + String(meta.description).length + '字' : '',
+    meta.rating ? '评分=' + meta.rating : '',
+    harvest.imgCount ? '图=' + harvest.imgCount : '',
+  ]
+    .filter(Boolean)
+    .join(' | ');
+  return (
+    '\n包装采集: ' +
+    (dims || '未抽出尺寸/重量') +
+    '\n规格: ' +
+    (extraSpecs || chars || '无') +
+    (metaLine ? '\n商品信息: ' + metaLine : '') +
+    '\nOzon API: pages=' +
+    (harvest.pageCount || 0) +
+    (fetches ? '\n' + fetches : '') +
+    (harvest.error ? '\nharvest error: ' + harvest.error : '') +
+    (Array.isArray(harvest.debug) && harvest.debug.length
+      ? '\n字段探测: ' + harvest.debug.map((item) => item.key + ' → ' + item.snippet).join('\n')
+      : '')
+  );
+}
+
 async function load() {
-  const cfg = await chrome.storage.local.get({ ...defaults, lastIngest: null });
+  const cfg = await chrome.storage.local.get({ ...defaults, lastIngest: null, lastHarvest: null });
   const api = resolveStoredCollectorApi(cfg.api, cfg.apiHostVersion);
   if (api !== cfg.api || cfg.apiHostVersion !== API_DEFAULT_VERSION) {
     await chrome.storage.local.set({ api, apiHostVersion: API_DEFAULT_VERSION });
@@ -64,13 +125,19 @@ async function load() {
   document.getElementById('token').value = cfg.token;
   document.getElementById('tenant').value = cfg.tenant;
   refreshIdentity();
+  const harvest = (cfg.lastIngest && cfg.lastIngest.harvest) || cfg.lastHarvest;
   if (cfg.lastIngest && cfg.lastIngest.at) {
     const ago = Math.round((Date.now() - cfg.lastIngest.at) / 1000);
     if (ago < 600) {
       document.getElementById('log').textContent = cfg.lastIngest.ok
-        ? `上次采集成功（${ago}s 前） sku=${cfg.lastIngest.skuId}\n` + JSON.stringify(cfg.lastIngest.data, null, 2)
-        : `上次采集失败（${ago}s 前）: ${cfg.lastIngest.error}`;
+        ? `上次采集成功（${ago}s 前） sku=${cfg.lastIngest.skuId}` +
+          harvestSummary(harvest) +
+          '\n' +
+          JSON.stringify(cfg.lastIngest.data, null, 2)
+        : `上次采集失败（${ago}s 前）: ${cfg.lastIngest.error}` + harvestSummary(harvest);
     }
+  } else if (harvest && harvest.at && Date.now() - harvest.at < 600000) {
+    document.getElementById('log').textContent = '上次包装探测' + harvestSummary(harvest);
   }
 }
 
@@ -114,11 +181,12 @@ document.getElementById('manual').onclick = async () => {
         return;
       }
       if (!res || !res.ok) {
-        document.getElementById('log').textContent = '回传失败: ' + ((res && res.error) || 'unknown');
+        document.getElementById('log').textContent =
+          '回传失败: ' + ((res && res.error) || 'unknown') + harvestSummary(res && res.harvest);
         return;
       }
       document.getElementById('log').textContent =
-        '已写入选品复审（当前页主 SKU）\n' + JSON.stringify(res.data, null, 2);
+        '已写入选品复审（当前页主 SKU）' + harvestSummary(res.harvest) + '\n' + JSON.stringify(res.data, null, 2);
     });
   } catch (error) {
     document.getElementById('log').textContent = error instanceof Error ? error.message : String(error);
