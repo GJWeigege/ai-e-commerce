@@ -37,3 +37,4 @@ export * from './wb-listing.client';
 export * from './wb-listing.adapter';
 export * from './wb-catalog.store';
 export * from './wb-sdk.transport';
+export * from './wb-stock-warehouses';

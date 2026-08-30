@@ -1169,6 +1169,19 @@ export function buildWbUploadPayload(input: {
   ];
 }
 
+/** WB 库存接口 2026-05-20 起只接受尺码 ID；Content 返回 chrtID，Marketplace 提交 chrtId */
+export function collectWbChrtIds(
+  sizes?: Array<{ chrtID?: number; chrtId?: number }> | null,
+): number[] {
+  return [
+    ...new Set(
+      (sizes || [])
+        .map((item) => Number(item.chrtID ?? item.chrtId))
+        .filter((id) => Number.isFinite(id) && id > 0),
+    ),
+  ];
+}
+
 export function collectImageUrls(draft: WbProductDraft): string[] {
   const all = [
     ...draft.imageUrls,

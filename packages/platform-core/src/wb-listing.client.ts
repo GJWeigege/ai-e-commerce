@@ -1,5 +1,5 @@
 import { WbCardRef, WbCardUpdateItem, WbCardUploadItem, WbCharacteristicMeta, WbDirectoryItem, WbSubject } from './wb-listing.types';
-import { createWbSdkApis, readWbSdkErrorBody, WbSdkApis } from './wb-sdk.transport';
+import { createWbSdkApis, formatWbErrorPayload, readWbSdkErrorBody, WbSdkApis } from './wb-sdk.transport';
 import { WbRateLimiter, wbRateLimiterForToken } from './wb-rate-limiter';
 
 export class WbHttpError extends Error {
@@ -431,18 +431,20 @@ export class WbHttpClient {
           `${this.marketplaceBase}/api/v3/warehouses`,
         ),
     );
-    const rows = Array.isArray(json) ? json : json.data || [];
+    const rows = Array.isArray(json) ? json : json && typeof json === 'object' ? json.data || [] : [];
     return rows
       .map((item) => ({
         id: Number(item.id),
         name: String(item.name ?? ''),
         cargoType: item.cargoType == null ? undefined : Number(item.cargoType),
         deliveryType: item.deliveryType == null ? undefined : Number(item.deliveryType),
+        isDeleting: item.isDeleting === true,
+        isProcessing: item.isProcessing === true,
       }))
-      .filter((item) => item.id);
+      .filter((item) => item.id && !item.isDeleting && !item.isProcessing);
   }
 
-  async setStocks(warehouseId: number, stocks: Array<{ sku: string; amount: number }>): Promise<void> {
+  async setStocks(warehouseId: number, stocks: Array<{ chrtId: number; amount: number }>): Promise<void> {
     await this.sdkCall(
       () =>
         this.sdk.marketplace.apiV3StocksWarehouseIdPut({
@@ -496,17 +498,17 @@ export class WbHttpClient {
           this.limiter.notifyOk();
           if (Array.isArray(parsed)) {
             if (!response.ok) {
-              throw new WbHttpError(`Wildberries HTTP ${response.status}`, response.status, response.status >= 500);
+              throw new WbHttpError(
+                formatWbErrorPayload(parsed, response.status),
+                response.status,
+                response.status >= 500,
+              );
             }
             return parsed as T;
           }
           const json = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
           if (!response.ok || json.error === true) {
-            throw new WbHttpError(
-              formatWbError(json, response.status),
-              response.status,
-              response.status >= 500,
-            );
+            throw new WbHttpError(formatWbErrorPayload(json, response.status), response.status, response.status >= 500);
           }
           return json as T;
         } catch (error) {
@@ -589,7 +591,8 @@ function parseCardRefs(rows: Array<Record<string, unknown>> | undefined, vendorC
       title: item.title == null ? undefined : String(item.title),
       sizes: Array.isArray(item.sizes)
         ? (item.sizes as Array<Record<string, unknown>>).map((size) => ({
-            chrtID: size.chrtID == null ? undefined : Number(size.chrtID),
+            chrtID:
+              size.chrtID == null && size.chrtId == null ? undefined : Number(size.chrtID ?? size.chrtId),
             techSize: String(size.techSize ?? '0'),
             wbSize: size.wbSize == null ? undefined : String(size.wbSize),
             skus: Array.isArray(size.skus) ? size.skus.map(String) : [],
@@ -600,17 +603,7 @@ function parseCardRefs(rows: Array<Record<string, unknown>> | undefined, vendorC
 }
 
 function formatWbError(json: Record<string, unknown>, status: number): string {
-  const extra = json.additionalErrors;
-  const extraText =
-    extra && typeof extra === 'object'
-      ? Object.values(extra as Record<string, unknown>)
-          .flat()
-          .map(String)
-          .join('；')
-      : extra
-        ? String(extra)
-        : '';
-  return [json.errorText || json.message || json.error, extraText].filter(Boolean).join('；') || `Wildberries HTTP ${status}`;
+  return formatWbErrorPayload(json, status);
 }
 
 function readRetryAfter(response: Response): number | null {

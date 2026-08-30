@@ -12,7 +12,16 @@ import {
   buildSelectionPrompt,
   parseSelectionOutput,
 } from '@aiecom/llm-core';
-import { collectImageUrls, isWbVendorCodeConflict, WbHttpError, WbListingHints, WbProductDraft } from '@aiecom/platform-core';
+import {
+  collectImageUrls,
+  collectWbChrtIds,
+  inferWbCargoType,
+  isWbVendorCodeConflict,
+  mapWbDimensions,
+  WbHttpError,
+  WbListingHints,
+  WbProductDraft,
+} from '@aiecom/platform-core';
 import { computeShelfStock, computeWbShelfPrice, PriceSource, ShelfPriceMode } from './shelf-price';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { PageQueryDto, PageResult } from '../../common/dto/page-query.dto';
@@ -431,22 +440,30 @@ export class ProductService {
         warnings.push(`价格: ${this.errorText(priceResult.reason)}`);
       }
       try {
-        let barcodes = listed.barcodes?.filter(Boolean) || [];
-        if (!barcodes.length) {
+        // WB 2026-05-20 起库存只认 chrtId，条码 sku 会直接 400
+        let chrtIds = collectWbChrtIds((listed.chrtIds || []).map((chrtId) => ({ chrtId })));
+        if (!chrtIds.length) {
           for (const delay of [400, 1000]) {
             await this.sleep(delay);
             const card = await adapter.findCard(listed.vendorCode);
-            barcodes = card?.sizes?.flatMap((item) => item.skus).filter(Boolean) || [];
-            if (barcodes.length) {
+            chrtIds = collectWbChrtIds(card?.sizes);
+            if (chrtIds.length) {
               break;
             }
           }
         }
-        if (!barcodes.length) {
-          throw new Error('卡片条码尚未同步，无法写入库存（请稍后重新上架同步库存）');
+        if (!chrtIds.length) {
+          throw new Error('卡片尺码 ID（chrtId）尚未同步，无法写入库存（请稍后重新上架同步库存）');
         }
-        const warehouseId = await adapter.setStocks(barcodes, stock, this.adapters.warehouseId(shop));
-        await this.adapters.rememberWarehouse(shop.id, warehouseId);
+        const cargoType = inferWbCargoType(mapWbDimensions(draft.specs, draft));
+        // 大件必须写到 ODC/CD+ 仓；记住的小件仓会触发 CargoWarehouseRestrictionSGTKGTPlus
+        const warehouseId = await adapter.setStocks(
+          chrtIds,
+          stock,
+          this.adapters.warehouseId(shop, cargoType),
+          cargoType,
+        );
+        await this.adapters.rememberWarehouse(shop.id, warehouseId, cargoType);
         if (stock <= 0) {
           warnings.push('库存为 0：已同步到 WB，商品仍无法售卖，请在上架弹窗填写库存');
         }

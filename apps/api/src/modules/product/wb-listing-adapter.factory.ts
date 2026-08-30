@@ -33,8 +33,21 @@ export class WbListingAdapterFactory {
     });
   }
 
-  warehouseId(shop: PlatformAccount): number | undefined {
-    return positiveInt(this.extra(shop.extra).warehouseId) ?? positiveInt(process.env.WB_WAREHOUSE_ID);
+  warehouseId(shop: PlatformAccount, cargoType?: number): number | undefined {
+    const extra = this.extra(shop.extra);
+    const byType = this.warehousesByCargoType(extra);
+    if (cargoType === 2 || cargoType === 3) {
+      return (
+        positiveInt(byType['2']) ??
+        positiveInt(byType['3']) ??
+        positiveInt(extra.warehouseId) ??
+        positiveInt(process.env.WB_WAREHOUSE_ID)
+      );
+    }
+    if (cargoType === 1) {
+      return positiveInt(byType['1']) ?? positiveInt(extra.warehouseId) ?? positiveInt(process.env.WB_WAREHOUSE_ID);
+    }
+    return positiveInt(extra.warehouseId) ?? positiveInt(process.env.WB_WAREHOUSE_ID);
   }
 
   brand(shop: PlatformAccount): string | undefined {
@@ -42,20 +55,37 @@ export class WbListingAdapterFactory {
     return typeof brand === 'string' && brand.trim() ? brand.trim() : undefined;
   }
 
-  /** 首次同步库存后把探测到的仓库写回店铺，后续跳过仓库列表查询 */
-  async rememberWarehouse(shopId: string, warehouseId: number): Promise<void> {
+  /** 按货型记住可用仓库，避免小件仓和大件仓互相覆盖后下次再踩限 */
+  async rememberWarehouse(shopId: string, warehouseId: number, cargoType?: number): Promise<void> {
     const shop = await this.prisma.platformAccount.findUnique({ where: { id: shopId } });
     if (!shop) {
       return;
     }
     const extra = this.extra(shop.extra);
-    if (Number(extra.warehouseId) === warehouseId) {
+    const byType = this.warehousesByCargoType(extra);
+    const nextByType = cargoType ? { ...byType, [String(cargoType)]: warehouseId } : byType;
+    if (Number(extra.warehouseId) === warehouseId && JSON.stringify(byType) === JSON.stringify(nextByType)) {
       return;
     }
     await this.prisma.platformAccount.update({
       where: { id: shopId },
-      data: { extra: { ...extra, warehouseId } as Prisma.InputJsonValue },
+      data: { extra: { ...extra, warehouseId, warehousesByCargoType: nextByType } as Prisma.InputJsonValue },
     });
+  }
+
+  private warehousesByCargoType(extra: Record<string, unknown>): Record<string, number> {
+    const raw = extra.warehousesByCargoType;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return {};
+    }
+    const result: Record<string, number> = {};
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+      const id = positiveInt(value);
+      if (id) {
+        result[key] = id;
+      }
+    }
+    return result;
   }
 
   private extra(value: unknown): Record<string, unknown> {

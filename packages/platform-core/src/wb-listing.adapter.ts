@@ -11,6 +11,7 @@ import {
   mergeWbCardSizes,
   pickWbSubject,
   planWbCardRepair,
+  collectWbChrtIds,
   compactWbBrandDirectory,
   isGenericWbBrandName,
   resolveWbBrand,
@@ -20,6 +21,7 @@ import {
   WbCardRepairState,
 } from './wb-listing.mapper';
 import { WbHttpClient, WbHttpError, isWbVendorCodeConflict } from './wb-listing.client';
+import { cargoTypesFromStockError, rankWbStockWarehouses, type WbSellerWarehouse } from './wb-stock-warehouses';
 import {
   loadCatalogValue,
   resetSharedWbCatalogStore,
@@ -184,6 +186,7 @@ export class LiveWbListingAdapter implements IWbListingAdapter {
           nmId: card?.nmId,
           imtId: card?.imtId,
           barcodes: pushed.barcodes.length ? pushed.barcodes : card?.sizes?.flatMap((item) => item.skus) || [],
+          chrtIds: collectWbChrtIds(card?.sizes),
           uploaded: true,
           sized: state.sized,
           repairs,
@@ -205,6 +208,7 @@ export class LiveWbListingAdapter implements IWbListingAdapter {
           nmId: confirmed.card.nmId,
           imtId: confirmed.card.imtId,
           barcodes: pushed.barcodes.length ? pushed.barcodes : confirmed.card.sizes?.flatMap((item) => item.skus) || [],
+          chrtIds: collectWbChrtIds(confirmed.card.sizes),
           uploaded: true,
           sized: state.sized,
           repairs,
@@ -411,26 +415,67 @@ export class LiveWbListingAdapter implements IWbListingAdapter {
     await this.client.setPrice(nmId, Math.max(1, Math.round(price)), discount);
   }
 
-  async setStocks(barcodes: string[], amount: number, warehouseId?: number): Promise<number> {
-    const skus = [...new Set(barcodes.map((item) => String(item || '').trim()).filter(Boolean))];
-    if (!skus.length) {
-      throw new Error('卡片尚未生成条码，无法同步库存');
+  async setStocks(chrtIds: number[], amount: number, warehouseId?: number, cargoType?: number): Promise<number> {
+    const ids = collectWbChrtIds(chrtIds.map((chrtId) => ({ chrtId })));
+    if (!ids.length) {
+      throw new Error('卡片尚未生成尺码 ID（chrtId），无法同步库存');
     }
-    const warehouse = warehouseId || this.warehouseId || (await this.resolveWarehouseId());
-    if (!warehouse) {
-      throw new Error('未找到可同步库存的卖家仓库。Token 需含 Marketplace 权限，并在店铺 extra.warehouseId 指定仓库');
+    const stocks = ids.map((chrtId) => ({ chrtId, amount: Math.max(0, Math.round(amount)) }));
+    const preferred = warehouseId || this.warehouseId;
+    const warehouses = (await this.client.listWarehouses().catch(() => [] as WbSellerWarehouse[])).map((item) => ({
+      id: item.id,
+      name: item.name,
+      cargoType: item.cargoType,
+      deliveryType: item.deliveryType,
+    }));
+    let needed: number | number[] | undefined = cargoType;
+    let candidates = rankWbStockWarehouses(warehouses, { preferredId: preferred, cargoType: needed });
+    if (!candidates.length) {
+      if (!preferred) {
+        throw new Error('未找到可同步库存的卖家仓库。Token 需含 Marketplace 权限，并在店铺 extra.warehouseId 指定仓库');
+      }
+      candidates = [{ id: preferred, name: '' }];
     }
+
+    let lastError: Error | null = null;
+    const tried = new Set<number>();
+    for (let index = 0; index < candidates.length; index += 1) {
+      const warehouse = candidates[index];
+      if (tried.has(warehouse.id)) {
+        continue;
+      }
+      tried.add(warehouse.id);
+      try {
+        await this.putStocksWithRetry(warehouse.id, stocks);
+        return warehouse.id;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        const required = cargoTypesFromStockError(lastError.message);
+        if (!required) {
+          continue;
+        }
+        needed = required;
+        const rest = rankWbStockWarehouses(
+          warehouses.filter((item) => !tried.has(item.id)),
+          { cargoType: required },
+        );
+        candidates = candidates.slice(0, index + 1).concat(rest);
+      }
+    }
+    throw lastError || new Error('库存同步失败');
+  }
+
+  private async putStocksWithRetry(warehouseId: number, stocks: Array<{ chrtId: number; amount: number }>): Promise<void> {
     let lastError: Error | null = null;
     for (let attempt = 0; attempt < 4; attempt += 1) {
       try {
-        await this.client.setStocks(
-          warehouse,
-          skus.map((sku) => ({ sku, amount: Math.max(0, Math.round(amount)) })),
-        );
-        return warehouse;
+        await this.client.setStocks(warehouseId, stocks);
+        return;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
-        // 新建卡后库存服务偶发未就绪 / 仓库短暂不可写
+        if (cargoTypesFromStockError(lastError.message)) {
+          throw lastError;
+        }
         if (!/429|503|500|not found|не найден|еще не|not ready|timeout|fetch failed/i.test(lastError.message) && attempt > 0) {
           break;
         }
@@ -577,20 +622,6 @@ export class LiveWbListingAdapter implements IWbListingAdapter {
   private listSubjectsByParentCached(parentID: number, locale: string) {
     return loadCatalogValue(this.catalogStore, 'subjects-by-parent', `${parentID}|${locale}`, () =>
       this.client.listSubjectsByParent(parentID, locale),
-    );
-  }
-
-  private async resolveWarehouseId(): Promise<number | null> {
-    const warehouses = await this.client.listWarehouses();
-    if (!warehouses.length) {
-      return null;
-    }
-    // deliveryType: 1 = FBS 自配送仓库；优先选名称含 склад / warehouse 的
-    return (
-      warehouses.find((item) => item.deliveryType === 1)?.id ||
-      warehouses.find((item) => /склад|warehouse|fbs/i.test(item.name))?.id ||
-      warehouses[0]?.id ||
-      null
     );
   }
 

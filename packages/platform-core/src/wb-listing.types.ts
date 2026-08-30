@@ -95,6 +95,8 @@ export type WbListProductResult = {
   nmId?: number;
   imtId?: number;
   barcodes?: string[];
+  /** 卡片尺码 ID，库存接口必须用 chrtId，不能再传条码 sku */
+  chrtIds?: number[];
   uploaded: boolean;
   /** 本次实际按尺码/无尺码建卡，供上层回写类目映射表 */
   sized?: boolean;
@@ -133,6 +135,6 @@ export interface IWbListingAdapter {
   listErrors(vendorCode?: string): Promise<string[]>;
   saveMedia(nmId: number, urls: string[]): Promise<void>;
   setPrice(nmId: number, price: number, discount?: number): Promise<void>;
-  setStocks(barcodes: string[], amount: number, warehouseId?: number): Promise<number>;
+  setStocks(chrtIds: number[], amount: number, warehouseId?: number, cargoType?: number): Promise<number>;
   unlist(nmIds: number[]): Promise<void>;
 }
