@@ -166,7 +166,19 @@ function normCharName(name: string): string {
 
 function looksLikePhysicalSizeValue(raw: string): boolean {
   const value = String(raw || '');
-  return /[xх×*]/.test(value) && /(см|mm|мм|cm)(?![a-zа-яё])/i.test(value) && (value.match(/\d+/g) || []).length >= 2;
+  return /[xх×*]/.test(value) && (value.match(/\d+/g) || []).length >= 2;
+}
+
+function shouldTreatAsCm(nums: number[], source: string, height: number): boolean {
+  const blob = source.toLowerCase();
+  if (/см|cm/.test(blob) && !/мм|mm/.test(blob)) {
+    return true;
+  }
+  if (/мм|mm/.test(blob)) {
+    return false;
+  }
+  const max = Math.max(0, ...nums.filter((item) => item > 0));
+  return !height && max >= 40 && max <= 400;
 }
 
 function parseSizePairsMm(raw: string): Array<{ depth: number; width: number; height: number }> {
@@ -176,18 +188,18 @@ function parseSizePairsMm(raw: string): Array<{ depth: number; width: number; he
     /(\d+(?:\.\d+)?)\s*(см|mm|мм|cm)?\s*[xх×*]\s*(\d+(?:\.\d+)?)\s*(см|mm|мм|cm)?(?:\s*[xх×*]\s*(\d+(?:\.\d+)?)\s*(см|mm|мм|cm)?)?/gi;
   let match: RegExpExecArray | null;
   while ((match = re.exec(source))) {
-    const unit = `${match[2] || ''} ${match[4] || ''} ${match[6] || ''} ${source}`.toLowerCase();
-    const asCm = /см|cm/.test(unit) && !/мм|mm/.test(unit);
-    const toMm = (value?: string) => {
-      const num = Number(value);
-      if (!Number.isFinite(num) || num <= 0) {
-        return 0;
-      }
-      return asCm ? num * 10 : num;
-    };
-    const depth = toMm(match[1]);
-    const width = toMm(match[3]);
-    const height = toMm(match[5]);
+    const rawDepth = Number(match[1]);
+    const rawWidth = Number(match[3]);
+    const rawHeight = Number(match[5] || 0);
+    if (![rawDepth, rawWidth].every((item) => Number.isFinite(item) && item > 0)) {
+      continue;
+    }
+    const unitBlob = `${match[2] || ''} ${match[4] || ''} ${match[6] || ''} ${source}`;
+    const asCm = shouldTreatAsCm([rawDepth, rawWidth, rawHeight], unitBlob, rawHeight);
+    const toMm = (value: number) => (asCm ? value * 10 : value);
+    const depth = toMm(rawDepth);
+    const width = toMm(rawWidth);
+    const height = rawHeight > 0 ? toMm(rawHeight) : 0;
     if (depth > 0 && width > 0 && depth < 5000 && width < 5000 && height < 5000) {
       pairs.push({ depth, width, height });
     }
@@ -200,29 +212,8 @@ function parseDimensionMm(raw: string): { depth: number; width: number; height: 
   if (triples.length) {
     return triples.sort((a, b) => b.depth * b.width * b.height - a.depth * a.width * a.height)[0];
   }
-  const source = String(raw || '');
-  const text = source.replace(/,/g, '.').replace(/\s+/g, '').trim();
-  const match = text.match(
-    /^(\d+(?:\.\d+)?)\s*[xх×*]\s*(\d+(?:\.\d+)?)(?:\s*[xх×*]\s*(\d+(?:\.\d+)?))?(?:мм|mm|см|cm)?$/i,
-  );
-  if (!match || !match[3]) {
-    return null;
-  }
-  const unit = /см|cm/i.test(source) && !/мм|mm/i.test(source) ? 'cm' : 'mm';
-  const toMm = (value: string) => {
-    const num = Number(value);
-    if (!Number.isFinite(num) || num <= 0) {
-      return 0;
-    }
-    return unit === 'cm' ? num * 10 : num;
-  };
-  const depth = toMm(match[1]);
-  const width = toMm(match[2]);
-  const height = toMm(match[3]);
-  if (![depth, width, height].every((item) => item > 0 && item < 5000)) {
-    return null;
-  }
-  return { depth, width, height };
+  const pairs = parseSizePairsMm(raw);
+  return pairs.sort((a, b) => b.depth * b.width - a.depth * a.width)[0] || null;
 }
 
 function parseWeightGrams(raw: string, name = ''): number {
@@ -249,8 +240,9 @@ function parseWeightGrams(raw: string, name = ''): number {
   return Math.round(num);
 }
 
-const SIZE_NAME_RE = /^(размер(?!а производителя)|габарит|длина\s*,?\s*мм|ширина|высота|глубина)/;
-const WEIGHT_NAME_RE = /^(вес(?![а-яё])|вес товара|вес брутто|вес упаков|вес,|масса(?![а-яё])|weight)/;
+const SIZE_NAME_RE = /^(размер(?!а производителя)|габарит|длина|ширина|высота|глубина)/;
+const WEIGHT_NAME_RE =
+  /^(вес(?![а-яё])|вес товара|вес брутто|вес упаков|вес в упаков|вес нетто|вес,|масса(?![а-яё])|weight)/;
 const SKIP_SIZE_RE = /экран|диагональ|ssd|памят|кольц|ring|длина в мм/;
 const SKIP_WEIGHT_RE = /весь ozon|весы(?:\s|$)/;
 
@@ -301,28 +293,27 @@ export function warehouseSpecsFromCharacteristics(specs: ProductSpec[]): Product
           continue;
         }
         const parsed = parseDimensionMm(spec.value);
-        if (parsed) {
-          extra.push(
-            { name: 'Длина, мм', value: String(Math.round(parsed.depth)) },
-            { name: 'Ширина, мм', value: String(Math.round(parsed.width)) },
-            { name: 'Высота, мм', value: String(Math.round(parsed.height)) },
-          );
-          break;
-        }
-        const pairs = parseSizePairsMm(spec.value).sort((a, b) => b.depth * b.width - a.depth * a.width);
-        const best = pairs[0];
-        if (!best) {
+        if (!parsed || parsed.depth <= 0 || parsed.width <= 0) {
           continue;
         }
-        const height = best.height || toMmFromNamed(named.height, named.height);
-        if (best.depth > 0 && best.width > 0 && height > 0 && height < 5000) {
-          extra.push(
-            { name: 'Длина, мм', value: String(Math.round(Math.max(best.depth, best.width))) },
-            { name: 'Ширина, мм', value: String(Math.round(Math.min(best.depth, best.width))) },
-            { name: 'Высота, мм', value: String(Math.max(1, Math.round(height))) },
-          );
-          break;
+        const thick = toMmFromNamed(named.height, named.height);
+        const defaultHeight = Math.max(parsed.depth, parsed.width) >= 400 ? 20 : 0;
+        const height = parsed.height > 0 ? parsed.height : thick || defaultHeight;
+        if (height <= 0 || height >= 5000) {
+          continue;
         }
+        extra.push(
+          {
+            name: 'Длина, мм',
+            value: String(Math.round(parsed.height > 0 ? parsed.depth : Math.max(parsed.depth, parsed.width))),
+          },
+          {
+            name: 'Ширина, мм',
+            value: String(Math.round(parsed.height > 0 ? parsed.width : Math.min(parsed.depth, parsed.width))),
+          },
+          { name: 'Высота, мм', value: String(Math.max(1, Math.round(height))) },
+        );
+        break;
       }
     }
   }

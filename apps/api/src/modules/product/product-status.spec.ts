@@ -1,4 +1,4 @@
-import { canUnlistShopListing } from './product-status';
+import { canListProduct, canUnlistShopListing, PRODUCT_CATALOG_STATUSES } from './product-status';
 
 describe('canUnlistShopListing', () => {
   it('allows listed and in-flight jobs', () => {
@@ -15,5 +15,16 @@ describe('canUnlistShopListing', () => {
   it('rejects never-listed or already unlisted records', () => {
     expect(canUnlistShopListing({ status: 'NONE', wbNmId: null })).toBe(false);
     expect(canUnlistShopListing({ status: 'UNLISTED', wbNmId: 1n })).toBe(false);
+  });
+});
+
+describe('product catalog statuses', () => {
+  it('lets crawled products enter the catalog without an approve hop', () => {
+    expect(PRODUCT_CATALOG_STATUSES).toEqual(
+      expect.arrayContaining(['CRAWLED', 'AI_PENDING', 'APPROVED', 'ON_SHELF', 'OFF_SHELF']),
+    );
+    expect(canListProduct('CRAWLED')).toBe(true);
+    expect(canListProduct('APPROVED')).toBe(true);
+    expect(canListProduct('REJECTED')).toBe(false);
   });
 });

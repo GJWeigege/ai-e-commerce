@@ -1,6 +1,6 @@
-import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
 import { ArrayMinSize, ArrayUnique, IsArray, IsBoolean, IsEnum, IsNumber, IsOptional, IsString, IsUUID, Min } from 'class-validator';
-import { ProductStatus, ReviewAction, WbListingStatus } from '@prisma/client';
+import { ProductStatus, WbListingStatus } from '@prisma/client';
 import { Transform, Type } from 'class-transformer';
 import { RequirePermissions } from '../../common/decorators/auth.decorators';
 import { CurrentTenantId, CurrentUser } from '../../common/decorators/current.decorators';
@@ -16,11 +16,6 @@ class ProductQueryDto extends PageQueryDto {
   @IsOptional()
   @IsString()
   keyword?: string;
-
-  @IsOptional()
-  @Transform(({ value }) => value === true || value === 'true' || value === '1')
-  @IsBoolean()
-  reviewOnly?: boolean;
 
   @IsOptional()
   @Transform(({ value }) => value === true || value === 'true' || value === '1')
@@ -63,19 +58,6 @@ class UpdateProductDto {
   @IsOptional()
   @Type(() => Number)
   stock?: number;
-
-  @IsOptional()
-  @IsString()
-  remark?: string;
-}
-
-class ReviewBatchDto {
-  @IsArray()
-  @IsString({ each: true })
-  ids: string[];
-
-  @IsEnum(ReviewAction)
-  action: 'APPROVE' | 'REJECT';
 
   @IsOptional()
   @IsString()
@@ -183,6 +165,25 @@ class ShelfDto {
   @IsArray()
   @IsString({ each: true })
   skuIds?: string[];
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(1)
+  wbSubjectId?: number;
+
+  @IsOptional()
+  @IsString()
+  wbSubjectName?: string;
+
+  @IsOptional()
+  @Transform(({ value }) => {
+    if (value === true || value === 'true' || value === '1') return true;
+    if (value === false || value === 'false' || value === '0') return false;
+    return null;
+  })
+  @IsBoolean()
+  sized?: boolean | null;
 }
 
 class BatchShelfDto extends ShelfDto {
@@ -191,6 +192,14 @@ class BatchShelfDto extends ShelfDto {
   @ArrayUnique()
   @IsUUID('all', { each: true })
   productIds: string[];
+}
+
+class BatchDeleteDto {
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayUnique()
+  @IsUUID('all', { each: true })
+  ids: string[];
 }
 
 @Controller('products')
@@ -220,16 +229,6 @@ export class ProductController {
     return this.productService.update(tenantId, user.id, id, dto);
   }
 
-  @Post('review/batch')
-  @RequirePermissions('product:review')
-  review(
-    @CurrentUser() user: AuthUser,
-    @CurrentTenantId() tenantId: string | null,
-    @Body() dto: ReviewBatchDto,
-  ) {
-    return this.productService.review(tenantId, user.id, dto.ids, dto.action, dto.remark);
-  }
-
   @Post('shelf/batch')
   @RequirePermissions('product:shelf')
   shelfBatch(
@@ -238,6 +237,18 @@ export class ProductController {
     @Body() dto: BatchShelfDto,
   ) {
     return this.productService.shelfMany(user, tenantId, dto.productIds, dto);
+  }
+
+  @Post('delete/batch')
+  @RequirePermissions('product:delete')
+  removeBatch(@CurrentTenantId() tenantId: string | null, @Body() dto: BatchDeleteDto) {
+    return this.productService.remove(tenantId, dto.ids);
+  }
+
+  @Delete(':id')
+  @RequirePermissions('product:delete')
+  remove(@CurrentTenantId() tenantId: string | null, @Param('id', new ParseUUIDPipe()) id: string) {
+    return this.productService.remove(tenantId, [id]);
   }
 
   @Patch(':id/shelf')

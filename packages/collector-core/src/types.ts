@@ -1,4 +1,5 @@
-import { StandardProduct } from '@aiecom/shared';
+import { inspectPackageDimensions, OzonWarehouseFilter, StandardProduct } from '@aiecom/shared';
+import { resolveWarehouseType } from './ozon-availability';
 
 export type CollectorType = 'ELECTRON' | 'CHROME_EXT';
 
@@ -24,15 +25,23 @@ export type CollectorConfig = {
   maxPrice?: number;
   /** 仅保留有货商品 */
   inStockOnly?: boolean;
+  /** 批量任务默认 true：无完整尺寸+重量不入库 */
+  requireSizeAndWeight?: boolean;
+  /** 库存必须高于该值才入库；不填则不按数量卡 */
+  minStockQuantity?: number;
+  /** 批量任务仓库筛选：FBO / FBS / ALL */
+  warehouseType?: OzonWarehouseFilter;
 };
 
 export const DEFAULT_COLLECTOR_CONFIG: CollectorConfig = {
   headless: true,
-  minDelayMs: 800,
-  maxDelayMs: 2200,
+  minDelayMs: 400,
+  maxDelayMs: 1000,
   maxRetry: 3,
   proxies: [],
   crawlAllSkus: false,
+  requireSizeAndWeight: false,
+  warehouseType: 'ALL',
 };
 
 /** 暂时关闭批量跟进全部规格 SKU，只保留当前页主 skuId。改回 true 即可恢复入口与写入逻辑。 */
@@ -90,7 +99,18 @@ export function mergeCollectorConfig(raw?: Record<string, unknown> | null): Coll
     minPrice: optionalBoundNumber(raw?.minPrice, 0, 100_000_000),
     maxPrice: optionalBoundNumber(raw?.maxPrice, 0, 100_000_000),
     inStockOnly: raw?.inStockOnly === true || raw?.inStockOnly === 'true',
+    requireSizeAndWeight: raw?.requireSizeAndWeight === true || raw?.requireSizeAndWeight === 'true',
+    minStockQuantity: optionalBoundNumber(raw?.minStockQuantity, 0, 10_000_000, true),
+    warehouseType: parseWarehouseFilter(raw?.warehouseType),
   };
+}
+
+function parseWarehouseFilter(value: unknown): OzonWarehouseFilter {
+  const raw = String(value || '').trim().toUpperCase();
+  if (raw === 'FBO' || raw === 'FBS') {
+    return raw;
+  }
+  return 'ALL';
 }
 
 function optionalBoundNumber(value: unknown, min: number, max: number, integer = false): number | undefined {
@@ -112,10 +132,25 @@ export function collectFilterMismatch(
     salesCount?: number;
     price?: number;
     stock?: number;
+    fboStock?: number | null;
+    fbsStock?: number | null;
+    warehouseType?: string | null;
+    name?: string | null;
+    description?: string | null;
+    specs?: Array<{ name: string; value: string }> | null;
+    skuOptions?: Array<{ name?: string; options?: Record<string, string> }> | null;
   },
   config: Pick<
     CollectorConfig,
-    'minRating' | 'minReviewCount' | 'minSalesCount' | 'minPrice' | 'maxPrice' | 'inStockOnly'
+    | 'minRating'
+    | 'minReviewCount'
+    | 'minSalesCount'
+    | 'minPrice'
+    | 'maxPrice'
+    | 'inStockOnly'
+    | 'requireSizeAndWeight'
+    | 'minStockQuantity'
+    | 'warehouseType'
   >,
 ): string | null {
   if (config.minRating != null && (product.rating ?? 0) < config.minRating) {
@@ -135,6 +170,32 @@ export function collectFilterMismatch(
   }
   if (config.inStockOnly && (product.stock ?? 0) <= 0) {
     return '库存为 0，已按「仅采集有货」跳过';
+  }
+  if (config.minStockQuantity != null && (product.stock ?? 0) <= config.minStockQuantity) {
+    return `库存 ${product.stock ?? 0} 未高于下限 ${config.minStockQuantity}`;
+  }
+  if (config.requireSizeAndWeight) {
+    const gaps = inspectPackageDimensions(product.specs ?? [], {
+      name: product.name,
+      description: product.description,
+      skuOptions: product.skuOptions ?? [],
+    });
+    if (gaps.missingSize) {
+      return '缺少包装尺寸（长/宽/高），已按「仅入库有尺寸和重量」跳过';
+    }
+    if (gaps.missingWeight) {
+      return '缺少重量，已按「仅入库有尺寸和重量」跳过';
+    }
+  }
+  const wanted = config.warehouseType;
+  if (wanted && wanted !== 'ALL') {
+    const actual = resolveWarehouseType(product);
+    if (wanted === 'FBO' && actual !== 'FBO' && actual !== 'MIXED') {
+      return `仓库类型为 ${actual || '未知'}，任务仅采集 FBO`;
+    }
+    if (wanted === 'FBS' && actual !== 'FBS' && actual !== 'MIXED') {
+      return `仓库类型为 ${actual || '未知'}，任务仅采集 FBS`;
+    }
   }
   return null;
 }

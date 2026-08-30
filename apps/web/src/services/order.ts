@@ -81,7 +81,6 @@ export function fetchDashboardStats() {
   return request<{
     tasks: number;
     products: number;
-    pendingReview: number;
     onShelf: number;
     sales: number;
     openAlerts: number;

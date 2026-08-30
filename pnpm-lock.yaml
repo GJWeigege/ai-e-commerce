@@ -207,6 +207,13 @@ importers:
       '@aiecom/shared':
         specifier: workspace:*
         version: link:../shared
+      wildberries-sdk:
+        specifier: 0.1.143
+        version: 0.1.143
+    devDependencies:
+      '@types/node':
+        specifier: ^22.17.0
+        version: 22.20.1
 
   packages/shared: {}
 
@@ -3957,6 +3964,9 @@ packages:
     resolution: {integrity: sha512-BLI3Tl1TW3Pvl70l3yq3Y64i+awpwXqsGBYWkkqMtnbXgrMD+yj7rhW0kuEDxzJaYXGjEW5ogapKNMEKNMjibA==}
     engines: {node: '>= 8'}
     hasBin: true
+
+  wildberries-sdk@0.1.143:
+    resolution: {integrity: sha512-NH12kKs+qI205M+oTc3HYx8DxtJwvWfNy2hUZ2UQI6fpR0Lvway+qqtm2rFgWNOneIEYAz4JQQiNYS07oe0+fA==}
 
   wordwrap@1.0.0:
     resolution: {integrity: sha512-gvVzJFlPycKc5dZN4yPkP8w7Dc37BtP1yczEneOb4uq34pXZcvrtRTmWV8W+Ume+XCxKgbjM+nevkyFPMybd4Q==}
@@ -8236,6 +8246,8 @@ snapshots:
   which@2.0.2:
     dependencies:
       isexe: 2.0.0
+
+  wildberries-sdk@0.1.143: {}
 
   wordwrap@1.0.0: {}
 

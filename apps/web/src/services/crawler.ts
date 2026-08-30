@@ -59,6 +59,9 @@ export function createCategoryTask(body: {
   minPrice?: number;
   maxPrice?: number;
   inStockOnly?: boolean;
+  requireSizeAndWeight?: boolean;
+  minStockQuantity?: number;
+  warehouseType?: 'FBO' | 'FBS' | 'ALL';
 }) {
   return request('/api/v1/crawler/tasks/category', { method: 'POST', body: JSON.stringify(body) });
 }
@@ -77,6 +80,9 @@ export function createUrlTask(body: {
   minPrice?: number;
   maxPrice?: number;
   inStockOnly?: boolean;
+  requireSizeAndWeight?: boolean;
+  minStockQuantity?: number;
+  warehouseType?: 'FBO' | 'FBS' | 'ALL';
 }) {
   return request('/api/v1/crawler/tasks/urls', { method: 'POST', body: JSON.stringify(body) });
 }
@@ -89,11 +95,25 @@ export function retryItem(itemId: string) {
   return request(`/api/v1/crawler/tasks/items/${itemId}/retry`, { method: 'POST' });
 }
 
-export function exportTask(taskId: string) {
-  return fetch(`/api/v1/crawler/tasks/${taskId}/export`, {
-    headers: {
-      Authorization: `Bearer ${localStorage.getItem('aiecom_token') ?? ''}`,
-      'X-Tenant-Id': localStorage.getItem('aiecom_tenant') ?? '',
-    },
-  });
+export function cancelTask(taskId: string) {
+  return request(`/api/v1/crawler/tasks/${taskId}/cancel`, { method: 'POST' });
+}
+
+export function deleteCrawlerTask(taskId: string) {
+  return request(`/api/v1/crawler/tasks/${taskId}`, { method: 'DELETE' });
+}
+
+export async function exportTask(taskId: string) {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${localStorage.getItem('aiecom_token') ?? ''}`,
+  };
+  const tenantId = localStorage.getItem('aiecom_tenant');
+  if (tenantId) {
+    headers['X-Tenant-Id'] = tenantId;
+  }
+  const response = await fetch(`/api/v1/crawler/tasks/${taskId}/export`, { headers });
+  if (!response.ok) {
+    throw new Error(`导出失败（HTTP ${response.status}）`);
+  }
+  return response;
 }

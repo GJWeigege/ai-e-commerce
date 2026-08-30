@@ -71,12 +71,15 @@ services:
       WB_CONTENT_API_BASE: ${WB_CONTENT_API_BASE:-}
       WB_PRICES_API_BASE: ${WB_PRICES_API_BASE:-}
       WB_MARKETPLACE_API_BASE: ${WB_MARKETPLACE_API_BASE:-}
+      WB_CATALOG_DIR: /app/config/wb-catalog
+      WB_CATALOG_TTL_DAYS: ${WB_CATALOG_TTL_DAYS:-14}
       RUN_SEED: ${RUN_SEED:-false}
       SEED_ADMIN_USERNAME: ${SEED_ADMIN_USERNAME:-admin}
       SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}
       SEED_DEMO_PASSWORD: ${SEED_DEMO_PASSWORD:-}
     volumes:
       - aiecom_uploads:/app/uploads
+      - aiecom_wb_catalog:/app/config/wb-catalog
     depends_on:
       - postgres
       - redis
@@ -100,6 +103,7 @@ volumes:
   aiecom_pg_data:
   aiecom_redis_data:
   aiecom_uploads:
+  aiecom_wb_catalog:
 
 networks:
   internal:

@@ -26,6 +26,8 @@ pnpm dev:web
 
 商品库「上架 / 下架」走 Wildberries Content API：上架会在所选店铺建卡并轮询 nmID，同一商品可上架到多个店铺；下架会把对应店铺卡片移入回收站。店铺由**超级管理员**在「店铺管理」里按租户开通并保存卖家后台「Access to API」生成的**内容**类 Token（请求头为 `Authorization: {token}`，不要加 Bearer）。租户管理员不能自行增改店铺，避免用一个额度换绑。操作员只能使用管理员分配的店铺。
 
+WB 官方目录（颜色、性别、季节、品牌、类目）与租户/店铺无关，第一次从 WB 拉到后写入项目 `config/wb-catalog`，之后所有租户、店铺共用，默认 14 天刷新。品类多了以后：进程内是 LRU（默认约 600 条 / 48MB），类目检索按商品名散落所以不落盘，单个类目品牌表截到 2500 条，店铺已配品牌则根本不拉品牌目录。可用 `WB_CATALOG_DIR`、`WB_CATALOG_TTL_DAYS`、`WB_CATALOG_MEMORY_MAX_ENTRIES`、`WB_CATALOG_MEMORY_MAX_MB` 覆盖。这不是业务数据，不按租户隔离。
+
 ## 生产部署
 
 推荐：**境外单机（首选首尔）**，Docker Compose 跑 Postgres / Redis / API / Web。采集仍在运营电脑的 Chrome 插件。

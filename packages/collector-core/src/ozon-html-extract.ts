@@ -17,6 +17,7 @@ import {
   parseOzonWidgetPage,
   warehouseSpecsFromCharacteristics,
 } from './ozon-widget-parse';
+import { collectOzonAvailability } from './ozon-availability';
 
 const IMAGE_SIZE_DIR = /\/(?:wc|wcs|c)\d+\//i;
 
@@ -444,7 +445,7 @@ function isPdpGalleryWidgetKey(key: string): boolean {
 }
 
 function isTrustedDimWidgetKey(key: string): boolean {
-  return /webSale|webDelivery|webCharacteristics|webShortCharacteristics|webProductMainWidget|webDetailSKU|webPdp|webPrice/i.test(
+  return /webSale|webDelivery|webOutOfStock|webShipping|webCharacteristics|webShortCharacteristics|webProductMainWidget|webDetailSKU|webPdp|webPrice|webAspects|webAnnotation|webRichAnnotation/i.test(
     String(key || ''),
   );
 }
@@ -1117,28 +1118,28 @@ function collectCharacteristicsFromTree(trees: unknown[]): ProductSpec[] {
 }
 
 function parseOzonDimensionString(raw: unknown): { depth: number; width: number; height: number } | null {
-  const text = String(raw ?? '')
-    .replace(/,/g, '.')
-    .replace(/\s+/g, '')
-    .trim();
+  const source = String(raw ?? '');
+  const text = source.replace(/,/g, '.').replace(/\s+/g, '').trim();
   const match = text.match(
     /^(\d+(?:\.\d+)?)\s*[xх×*]\s*(\d+(?:\.\d+)?)(?:\s*[xх×*]\s*(\d+(?:\.\d+)?))?(?:мм|mm|см|cm)?$/i,
   );
-  if (!match || !match[3]) {
+  if (!match) {
     return null;
   }
-  const unit = /см|cm/i.test(String(raw ?? '')) && !/мм|mm/i.test(String(raw ?? '')) ? 'cm' : 'mm';
-  const toMm = (value: string) => {
-    const num = Number(value);
-    if (!Number.isFinite(num) || num <= 0) {
-      return 0;
-    }
-    return unit === 'cm' ? num * 10 : num;
-  };
-  const depth = toMm(match[1]);
-  const width = toMm(match[2]);
-  const height = toMm(match[3]);
-  if (![depth, width, height].every((item) => item > 0 && item < 5000)) {
+  const rawDepth = Number(match[1]);
+  const rawWidth = Number(match[2]);
+  const rawHeight = Number(match[3] || 0);
+  if (![rawDepth, rawWidth].every((item) => Number.isFinite(item) && item > 0)) {
+    return null;
+  }
+  const hasCm = /см|cm/i.test(source) && !/мм|mm/i.test(source);
+  const hasMm = /мм|mm/i.test(source);
+  const asCm = hasCm || (!hasMm && !rawHeight && Math.max(rawDepth, rawWidth) >= 40 && Math.max(rawDepth, rawWidth) <= 400);
+  const toMm = (value: number) => (asCm ? value * 10 : value);
+  const depth = toMm(rawDepth);
+  const width = toMm(rawWidth);
+  const height = rawHeight > 0 ? toMm(rawHeight) : 0;
+  if (![depth, width].every((item) => item > 0 && item < 5000) || height >= 5000) {
     return null;
   }
   return { depth, width, height };
@@ -1205,15 +1206,30 @@ function readPackageDimBlob(obj: Record<string, unknown>): {
   const depth = fromString ? fromString.depth : Number(src.depth ?? src.length ?? obj.depth ?? obj.length);
   const width = fromString ? fromString.width : Number(src.width ?? obj.width);
   const height = fromString ? fromString.height : Number(src.height ?? obj.height);
-  const weight = readPackageWeightGrams(src.weight ?? obj.weight ?? obj.weightGrams ?? obj.packageWeight);
+  const kg = Number(src.weightKg ?? obj.weightKg);
+  const weight =
+    Number.isFinite(kg) && kg > 0 && kg < 80
+      ? Math.round(kg * 1000)
+      : readPackageWeightGrams(
+          src.weight ??
+            obj.weight ??
+            obj.weightGrams ??
+            obj.packageWeight ??
+            obj.weightG ??
+            obj.itemWeight ??
+            obj.grossWeight,
+        );
   const hasEdges = [depth, width, height].every((item) => Number.isFinite(item) && item > 0 && item < 5000);
-  if (!hasEdges && !(weight > 0)) {
+  const hasFlat =
+    [depth, width].every((item) => Number.isFinite(item) && item > 0 && item < 5000) &&
+    Math.max(depth, width) >= 400;
+  if (!hasEdges && !hasFlat && !(weight > 0)) {
     return null;
   }
   return {
-    depth: hasEdges ? depth : 0,
-    width: hasEdges ? width : 0,
-    height: hasEdges ? height : 0,
+    depth: hasEdges || hasFlat ? depth : 0,
+    width: hasEdges || hasFlat ? width : 0,
+    height: hasEdges ? height : hasFlat ? 20 : 0,
     weight,
   };
 }
@@ -1255,11 +1271,26 @@ function walkJsonScoped(
   });
 }
 
+function hasLogisticsDimFields(obj: Record<string, unknown>): boolean {
+  return (
+    obj.dimension != null ||
+    obj.packageSize != null ||
+    obj.packageSizeMm != null ||
+    obj.packageWeight != null ||
+    obj.packageDimensions != null ||
+    obj.weight != null ||
+    obj.weightGrams != null ||
+    (obj.dimensions != null && typeof obj.dimensions === 'object')
+  );
+}
+
 function collectPackageDimsFromTree(trees: unknown[], pageSku = ''): ProductSpec[] {
   const edges: Array<{ depth: number; width: number; height: number; score: number }> = [];
   const weights: Array<{ weight: number; score: number }> = [];
   const take = (obj: Record<string, unknown>, sku: string, allowUnscoped: boolean) => {
-    if (pageSku && sku && sku !== pageSku) {
+    // 服装等变体页 URL SKU 和 cellTrackingInfo.product.sku 常不是同一个；
+    // 同 PDP 可信组件里的 dimension/weight 是发货包裹口径，seerfar 也按这个吃。
+    if (pageSku && sku && sku !== pageSku && !(allowUnscoped && hasLogisticsDimFields(obj))) {
       return;
     }
     if (pageSku && !sku && !allowUnscoped) {
@@ -1312,7 +1343,7 @@ function collectPackageDimsFromTree(trees: unknown[], pageSku = ''): ProductSpec
 
 function combinedSizeToken(text: string): string | null {
   const match = String(text || '').match(
-    /(\d+(?:[.,]\d+)?)\s*[xх×*]\s*(\d+(?:[.,]\d+)?)\s*[xх×*]\s*(\d+(?:[.,]\d+)?)\s*(мм|mm|см|cm)/i,
+    /(\d+(?:[.,]\d+)?)\s*[xх×*]\s*(\d+(?:[.,]\d+)?)(?:\s*[xх×*]\s*(\d+(?:[.,]\d+)?))?\s*(мм|mm|см|cm)/i,
   );
   return match ? match[0].replace(/\s+/g, ' ').trim() : null;
 }
@@ -1498,6 +1529,7 @@ export function extractOzonProductFromHtml(html: string, pageUrl: string): Parti
   const imageUrls = gallery.length ? gallery : uniqueOzonImages([og?.[1]]);
   const treePrices = collectPricesFromTree(trees);
   const price = offerPrice(jsonLd) || treePrices.price;
+  const availability = collectOzonAvailability(trees, price > 0 ? 1 : 0);
   const specs = mergeSpecs([
     collectWidgetPageSpecs(trees),
     collectPackageDimsFromTree(trees, skuId),
@@ -1551,7 +1583,10 @@ export function extractOzonProductFromHtml(html: string, pageUrl: string): Parti
     originalPrice: treePrices.originalPrice,
     discountPrice: treePrices.discountPrice,
     currency: 'RUB',
-    stock: price > 0 ? 1 : 0,
+    stock: availability.stock,
+    fboStock: availability.fboStock,
+    fbsStock: availability.fbsStock,
+    warehouseType: availability.warehouseType,
     specs,
     variants,
     skuOptions,

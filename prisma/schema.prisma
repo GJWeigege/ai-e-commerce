@@ -104,6 +104,13 @@ enum ProductStatus {
   OFF_SHELF
 }
 
+/// Ozon 履约仓类型（采集自 PDP；MIXED 表示 FBO 与 FBS 均有货）
+enum OzonFulfillment {
+  FBO
+  FBS
+  MIXED
+}
+
 enum WbListingStatus {
   NONE
   QUEUED
@@ -129,6 +136,13 @@ enum ReviewAction {
 enum PlatformCode {
   OZON
   WILDBERRIES
+}
+
+/// 类目映射来源：AUTO=首次上架自动检索，LEARNED=按 WB 报错自学习修正，MANUAL=人工指定
+enum WbCategoryMapSource {
+  AUTO
+  LEARNED
+  MANUAL
 }
 
 enum PlatformAccountStatus {
@@ -210,6 +224,7 @@ model Tenant {
   platformAccounts PlatformAccount[]
   userShopAccesses UserShopAccess[]
   productShopListings ProductShopListing[]
+  wbCategoryMappings  WbCategoryMapping[]
   collectorAgents  CollectorAgent[]
   crawlerTasks     CrawlerTask[]
   crawlerItems     CrawlerTaskItem[]
@@ -451,6 +466,35 @@ model ProductShopListing {
   @@map("product_shop_listings")
 }
 
+/// Ozon 面包屑 → Wildberries 类目映射。命中即跳过 WB 类目检索，是批量上架的主要提速点。
+model WbCategoryMapping {
+  id               String              @id @default(uuid())
+  tenantId         String
+  /// Ozon 面包屑归一化键（小写、统一分隔符），唯一索引用
+  ozonCategoryKey  String
+  /// 原始 Ozon 面包屑，供人工核对
+  ozonCategoryPath String
+  wbSubjectId      Int
+  wbSubjectName    String
+  /// 该 WB 类目是否按尺码建卡。null=未知，由上架报错自学习或人工确认
+  sized            Boolean?
+  source           WbCategoryMapSource @default(AUTO)
+  /// 命中次数，映射页按热度排序
+  hitCount         Int                 @default(0)
+  /// 最近一次上架失败原因，便于定位仍需人工干预的类目
+  lastError        String?
+  lastUsedAt       DateTime?
+  remark           String?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, ozonCategoryKey])
+  @@index([tenantId, wbSubjectId])
+  @@map("wb_category_mappings")
+}
+
 // ----------------------------- 爬虫 -----------------------------
 
 /// Chrome 插件 / Electron 在线采集端；服务端不再做线上爬取
@@ -594,6 +638,9 @@ model ProductSnapshot {
   videoUrls     String[] @default([])
   variants      Json     @default("[]")
   skuOptions    Json     @default("[]")
+  warehouseType OzonFulfillment?
+  fboStock      Int?
+  fbsStock      Int?
   rawPayload    Json?
   createdAt    DateTime @default(now())
 
@@ -606,7 +653,7 @@ model ProductSnapshot {
   @@map("product_snapshots")
 }
 
-/// 租户商品库：审核通过后进入，支持上架/下架，按租户隔离
+/// 租户商品库：采集完成后直接进入，可上下架；AI 选品作为后台评分能力保留
 model Product {
   id            String        @id @default(uuid())
   tenantId      String
@@ -631,7 +678,10 @@ model Product {
   videoUrls     String[]      @default([])
   variants      Json          @default("[]")
   skuOptions    Json          @default("[]")
-  status        ProductStatus @default(CRAWLED)
+  warehouseType OzonFulfillment?
+  fboStock      Int?
+  fbsStock      Int?
+  status        ProductStatus @default(APPROVED)
   remark        String?
   onShelfAt     DateTime?
   offShelfAt    DateTime?

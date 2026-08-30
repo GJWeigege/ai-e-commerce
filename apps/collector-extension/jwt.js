@@ -33,11 +33,11 @@ export function collectorIdentity(token, fallbackTenant) {
   };
 }
 
-/** 正式环境默认接口；本机调试在高级设置里改成 localhost 即可 */
-export const DEFAULT_COLLECTOR_API = 'http://43.133.72.201:8080/api/v1';
+/** 默认本机 API，避免未配置时把 JWT 发到公网明文 HTTP。线上地址在插件里手动填写。 */
 export const LOCAL_COLLECTOR_API = 'http://localhost:3000/api/v1';
-/** 从旧默认 localhost 迁到线上地址时 bump，避免覆盖用户已保存的 localhost */
-export const API_DEFAULT_VERSION = 1;
+export const DEFAULT_COLLECTOR_API = LOCAL_COLLECTOR_API;
+/** 从旧默认公网 HTTP 收回本机时 bump；已保存的自定义地址不会被覆盖 */
+export const API_DEFAULT_VERSION = 2;
 
 function isLoopbackHostname(hostname) {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';

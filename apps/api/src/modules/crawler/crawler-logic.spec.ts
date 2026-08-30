@@ -10,11 +10,12 @@ import {
 } from '@aiecom/collector-core';
 import { detectCaptchaOrBlock } from '@aiecom/collector-core';
 import { withRetry, CaptchaDetectedError } from '@aiecom/collector-core';
-import { extractOzonProductFromHtml, buildSkuOptions, parseOzonWidgetPage, parseLabeledDescriptionSpecs, warehouseSpecsFromCharacteristics } from '@aiecom/collector-core';
+import { extractOzonProductFromHtml, buildSkuOptions, parseOzonWidgetPage, parseLabeledDescriptionSpecs, warehouseSpecsFromCharacteristics, collectOzonAvailability, expandOzonDeliveryStateIds, findOzonDeliveryLayoutWidgets, planOzonDeliveryWidgetPosts, queueOzonComposerWidgets } from '@aiecom/collector-core';
 import { buildOzonCategoryListingUrl, extractOzonProductUrls, isOzonListingUrl, pickOzonProductUrls, toAllowedCollectUrl } from '@aiecom/collector-core';
-import { alignSkuOptions, combineFamilyListings, fillSkuOptionsFromVariants, inferWeightOption, isSameOzonFamily, keepMainSkuOnly, ozonListingSlugFamily, productFamilyKey } from '@aiecom/shared';
+import { alignSkuOptions, combineFamilyListings, fillSkuOptionsFromVariants, inferWeightOption, inspectPackageDimensions, isSameOzonFamily, keepMainSkuOnly, ozonListingSlugFamily, productFamilyKey } from '@aiecom/shared';
 import { scoreProduct } from '@aiecom/llm-core';
-import { PRODUCT_REVIEW_QUEUE_STATUSES } from '../product/product-status';
+import { PRODUCT_CATALOG_STATUSES } from '../product/product-status';
+import { collectFiltersFromDto } from './dto/collect-filters.dto';
 
 describe('parseProductUrlsFromCsv', () => {
   it('reads url column from header', () => {
@@ -51,6 +52,28 @@ describe('mergeCollectorConfig', () => {
     });
     expect(mergeCollectorConfig({}).minRating).toBeUndefined();
     expect(mergeCollectorConfig({}).inStockOnly).toBe(false);
+    expect(mergeCollectorConfig({}).requireSizeAndWeight).toBe(false);
+    expect(mergeCollectorConfig({}).warehouseType).toBe('ALL');
+    expect(mergeCollectorConfig({ requireSizeAndWeight: 'true', warehouseType: 'FBO', minStockQuantity: '12' })).toMatchObject({
+      requireSizeAndWeight: true,
+      warehouseType: 'FBO',
+      minStockQuantity: 12,
+    });
+  });
+});
+
+describe('collectFiltersFromDto', () => {
+  it('defaults batch ingest to size+weight required and all warehouses', () => {
+    expect(collectFiltersFromDto({})).toMatchObject({
+      requireSizeAndWeight: true,
+      warehouseType: 'ALL',
+      inStockOnly: false,
+    });
+    expect(collectFiltersFromDto({ requireSizeAndWeight: false, warehouseType: 'FBS', minStockQuantity: 20 })).toMatchObject({
+      requireSizeAndWeight: false,
+      warehouseType: 'FBS',
+      minStockQuantity: 20,
+    });
   });
 });
 
@@ -66,6 +89,81 @@ describe('collectFilterMismatch', () => {
     expect(collectFilterMismatch(product, mergeCollectorConfig({ minReviewCount: 50 }))).toContain('评价数');
     expect(collectFilterMismatch({ ...product, stock: 0 }, mergeCollectorConfig({ inStockOnly: true }))).toContain('库存');
     expect(collectFilterMismatch(product, mergeCollectorConfig({ minPrice: 100, maxPrice: 2000 }))).toBeNull();
+  });
+
+  it('skips products missing size and weight when the batch rule is on', () => {
+    expect(
+      collectFilterMismatch(
+        { ...product, specs: [{ name: 'Цвет', value: 'черный' }] },
+        mergeCollectorConfig({ requireSizeAndWeight: true }),
+      ),
+    ).toMatch(/尺寸|重量/);
+    expect(
+      collectFilterMismatch(
+        {
+          ...product,
+          specs: [
+            { name: 'Длина, мм', value: '200' },
+            { name: 'Ширина, мм', value: '100' },
+            { name: 'Высота, мм', value: '50' },
+            { name: 'Вес товара, г', value: '250' },
+          ],
+        },
+        mergeCollectorConfig({ requireSizeAndWeight: true }),
+      ),
+    ).toBeNull();
+  });
+
+  it('applies stock threshold and FBO/FBS warehouse filters', () => {
+    expect(collectFilterMismatch({ ...product, stock: 8 }, mergeCollectorConfig({ minStockQuantity: 10 }))).toContain('库存');
+    expect(collectFilterMismatch({ ...product, stock: 11 }, mergeCollectorConfig({ minStockQuantity: 10 }))).toBeNull();
+    expect(
+      collectFilterMismatch(
+        { ...product, warehouseType: 'FBS', fbsStock: 20 },
+        mergeCollectorConfig({ warehouseType: 'FBO' }),
+      ),
+    ).toContain('FBO');
+    expect(
+      collectFilterMismatch(
+        { ...product, warehouseType: 'MIXED', fboStock: 5, fbsStock: 5 },
+        mergeCollectorConfig({ warehouseType: 'FBO' }),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe('collectOzonAvailability', () => {
+  it('reads FBO/FBS stock flags from widget json', () => {
+    const avail = collectOzonAvailability(
+      [
+        {
+          fboStock: 40,
+          fbsStock: 8,
+          deliverySchema: 'FBO',
+        },
+      ],
+      1,
+    );
+    expect(avail.fboStock).toBe(40);
+    expect(avail.fbsStock).toBe(8);
+    expect(avail.warehouseType).toBe('MIXED');
+    expect(avail.stock).toBe(40);
+  });
+
+  it('does not treat a bare продавец mention as FBS', () => {
+    const avail = collectOzonAvailability(
+      [
+        {
+          title: 'Продавец',
+          text: 'информация о продавце',
+          stock: 12,
+        },
+      ],
+      0,
+    );
+    expect(avail.warehouseType).toBeUndefined();
+    expect(avail.fbsStock).toBeUndefined();
+    expect(avail.stock).toBe(12);
   });
 });
 
@@ -101,7 +199,7 @@ describe('ozon category listing url', () => {
   });
 
   it('harvests extra listing urls so skipped products can be backfilled to topN', () => {
-    expect(listingHarvestLimit(10)).toBe(30);
+    expect(listingHarvestLimit(10)).toBe(120);
     const urls = Array.from({ length: 20 }, (_, i) => `https://www.ozon.ru/product/item-${1000000000 + i}/`);
     const split = splitListingQueue(urls, 10);
     expect(split.immediate).toHaveLength(10);
@@ -113,6 +211,25 @@ describe('ozon category listing url', () => {
       next: split.pool.slice(0, 2),
       remaining: split.pool.slice(2),
     });
+  });
+
+  it('keeps harvesting past the old 80-url cap so topN=50 can still fill after filters', () => {
+    expect(listingHarvestLimit(50)).toBeGreaterThanOrEqual(500);
+    const urls = Array.from({ length: 400 }, (_, i) => `https://www.ozon.ru/product/item-${1000000000 + i}/`);
+    const split = splitListingQueue(urls, 50);
+    expect(split.immediate).toHaveLength(50);
+    expect(split.pool.length).toBeGreaterThanOrEqual(350);
+    const { next, remaining } = nextListingBackfill(split.pool, split.immediate, 42);
+    expect(next).toHaveLength(42);
+    expect(remaining.length).toBe(split.pool.length - 42);
+  });
+
+  it('does not drop listing pool urls beyond the old 80 cap', () => {
+    const pool = Array.from({ length: 200 }, (_, i) => `https://www.ozon.ru/product/item-${2000000000 + i}/`);
+    const existing = Array.from({ length: 50 }, (_, i) => `https://www.ozon.ru/product/item-${1000000000 + i}/`);
+    const { next, remaining } = nextListingBackfill(pool, existing, 20);
+    expect(next).toHaveLength(20);
+    expect(remaining).toHaveLength(180);
   });
 
   it('keeps the first unique product urls up to topN', () => {
@@ -602,6 +719,35 @@ describe('ozon html extract', () => {
       { name: 'Вес товара, г', value: '4500' },
     ]);
 
+    expect(
+      warehouseSpecsFromCharacteristics([
+        { name: 'Размер', value: '150x200 см' },
+        { name: 'Толщина', value: '5 мм' },
+        { name: 'Вес в упаковке', value: '800 г' },
+      ]),
+    ).toEqual(
+      expect.arrayContaining([
+        { name: 'Длина, мм', value: '2000' },
+        { name: 'Ширина, мм', value: '1500' },
+        { name: 'Высота, мм', value: '5' },
+        { name: 'Вес товара, г', value: '800' },
+      ]),
+    );
+
+    expect(
+      warehouseSpecsFromCharacteristics([
+        { name: 'Размер', value: '150х200' },
+        { name: 'Вес нетто', value: '0,8 кг' },
+      ]),
+    ).toEqual(
+      expect.arrayContaining([
+        { name: 'Длина, мм', value: '2000' },
+        { name: 'Ширина, мм', value: '1500' },
+        { name: 'Высота, мм', value: '20' },
+        { name: 'Вес товара, г', value: '800' },
+      ]),
+    );
+
     const html = extractOzonProductFromHtml(
       `<html><head><script type="application/json">${JSON.stringify({
         widgetStates: {
@@ -986,6 +1132,188 @@ describe('ozon html extract', () => {
     expect(product.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '49')).toBe(true);
     expect(product.specs?.some((item) => item.name === 'Длина, мм' && item.value === '250')).toBe(false);
     expect(product.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '999')).toBe(false);
+  });
+
+  it('reads seerfar-style package 350x250x25mm / 260g from a sibling variant sku on the same PDP', () => {
+    const product = extractOzonProductFromHtml(
+      `<html><head><script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product',
+        sku: '3430453777',
+        name: 'Блузка Bowiea',
+        offers: { price: 16846 },
+      })}</script><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webDelivery-12-default-1': JSON.stringify({
+            cellTrackingInfo: {
+              product: {
+                id: 3430453999,
+                sku: 3430453999,
+                dimension: '350x250x25',
+                weight: 260,
+              },
+            },
+            deliverySchema: 'FBO',
+            title: 'Со склада Ozon',
+            text: 'Доставим через 3 дня',
+          }),
+          'webSale-1': JSON.stringify({
+            cellTrackingInfo: {
+              product: {
+                sku: 3430453999,
+                dimension: '350x250x25',
+                weight: 260,
+              },
+            },
+          }),
+        },
+      })}</script></head><body><h1>Блузка Bowiea</h1></body></html>`,
+      'https://www.ozon.ru/product/bluzka-bowiea-3430453777/',
+    );
+    expect(product.specs?.some((item) => item.name === 'Длина, мм' && item.value === '350')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Ширина, мм' && item.value === '250')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Высота, мм' && item.value === '25')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '260')).toBe(true);
+    expect(product.warehouseType).toBe('FBO');
+    expect(
+      collectFilterMismatch(product, mergeCollectorConfig({ requireSizeAndWeight: true, warehouseType: 'FBO' })),
+    ).toBeNull();
+    const gaps = inspectPackageDimensions(product.specs ?? [], { name: product.name });
+    expect(gaps.missingSize).toBe(false);
+    expect(gaps.missingWeight).toBe(false);
+  });
+
+  it('reads package dims from webOutOfStock when Ozon hides webDelivery on the shirt PDP', () => {
+    const product = extractOzonProductFromHtml(
+      `<html><head><script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product',
+        sku: '3430453777',
+        name: 'Блузка Bowiea',
+        offers: { price: 16846 },
+      })}</script><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webOutOfStock-1832611-default-1': JSON.stringify({
+            cellTrackingInfo: {
+              product: {
+                sku: 3430453999,
+                dimension: '350x250x25',
+                weight: 260,
+              },
+            },
+            deliverySchema: 'FBO',
+          }),
+        },
+      })}</script></head><body><h1>Блузка Bowiea</h1></body></html>`,
+      'https://www.ozon.ru/product/bluzka-bowiea-3430453777/',
+    );
+    expect(product.specs?.some((item) => item.name === 'Длина, мм' && item.value === '350')).toBe(true);
+    expect(product.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '260')).toBe(true);
+    expect(product.warehouseType).toBe('FBO');
+  });
+
+  it('expands webOutOfStock widget id into the webDelivery request seerfar posts', () => {
+    expect(expandOzonDeliveryStateIds(['webOutOfStock-1832611-default-1'])).toEqual(
+      expect.arrayContaining(['webOutOfStock-1832611-default-1', 'webDelivery-1832611-default-1', 'webSale-1832611-default-1']),
+    );
+    expect(planOzonDeliveryWidgetPosts(['webOutOfStock-1832611-default-1'])).toEqual(
+      expect.arrayContaining(['webDelivery-1832611-default-1']),
+    );
+  });
+
+  it('does not rewrite characteristics/review ids into fake webDelivery posts', () => {
+    expect(expandOzonDeliveryStateIds(['webCharacteristics-3282540-default-1', 'webReviewGallery-3554366-default-1'])).toEqual(
+      ['webCharacteristics-3282540-default-1', 'webReviewGallery-3554366-default-1'],
+    );
+    const queued = queueOzonComposerWidgets(
+      [
+        { stateId: 'webCharacteristics-3282540-default-1', component: 'webCharacteristics', important: true },
+        { stateId: 'webReviewGallery-3554366-default-1', component: 'webReviewGallery', important: true },
+        { stateId: 'webDelivery-8727767-default-1', component: 'webDelivery', asyncData: 'real', important: true },
+        { stateId: 'webSale-2111389-default-1', component: 'webSale', important: true },
+      ],
+      8,
+    );
+    expect(queued.map((item) => item.stateId)).toEqual([
+      'webDelivery-8727767-default-1',
+      'webCharacteristics-3282540-default-1',
+      'webReviewGallery-3554366-default-1',
+      'webSale-2111389-default-1',
+    ]);
+  });
+
+  it('finds webDelivery in a nested Ozon layout even when the PDP only renders webOutOfStock', () => {
+    const widgets = findOzonDeliveryLayoutWidgets({
+      layout: [
+        {
+          component: 'container',
+          placeholders: [
+            {
+              widgets: [
+                { component: 'webOutOfStock', id: 1832611, asyncData: 'oos-async' },
+                { component: 'webDelivery', id: 9990001, asyncData: { skuId: '3430453777' } },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    expect(widgets.map((item) => item.stateId)).toEqual(
+      expect.arrayContaining(['webOutOfStock-1832611-default-1', 'webDelivery-9990001-default-1']),
+    );
+    expect(widgets.find((item) => /webDelivery/i.test(item.component))?.asyncData).toEqual({ skuId: '3430453777' });
+  });
+
+  it('keeps layout asyncData when an empty webDelivery stub is seen first', () => {
+    const widgets = findOzonDeliveryLayoutWidgets({
+      layout: [
+        { component: 'webDelivery', id: 8727767 },
+        { component: 'container', placeholders: [{ widgets: [{ component: 'webDelivery', id: 8727767, asyncData: 'eyJjaSI6e30=' }] }] },
+      ],
+    });
+    const delivery = widgets.find((item) => item.stateId === 'webDelivery-8727767-default-1');
+    expect(delivery?.asyncData).toBe('eyJjaSI6e30=');
+  });
+
+  it('does not invent 350x250x25 from seller volume 2.1875 when Ozon omitted dimension', () => {
+    const product = extractOzonProductFromHtml(
+      `<html><head><script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product',
+        sku: '3430453777',
+        name: 'Блузка Bowiea',
+        offers: { price: 16846 },
+      })}</script><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webCharacteristics-1': JSON.stringify({
+            characteristics: [{ name: 'Объем (Ozon аналитика)', values: ['2.1875'] }],
+          }),
+          'webOutOfStock-1832611-default-1': JSON.stringify({
+            title: 'Нет в наличии',
+            cellTrackingInfo: { product: { sku: 3430453777 } },
+          }),
+        },
+      })}</script></head><body><h1>Блузка Bowiea</h1></body></html>`,
+      'https://www.ozon.ru/product/bluzka-bowiea-3430453777/',
+    );
+    expect(product.specs?.some((item) => item.value === '350')).toBe(false);
+    expect(product.specs?.some((item) => item.value === '250')).toBe(false);
+    expect(product.specs?.some((item) => /Длина|Ширина|Высота|Вес/.test(item.name || ''))).toBe(false);
+    const gaps = inspectPackageDimensions(product.specs ?? [], { name: product.name });
+    expect(gaps.missingSize).toBe(true);
+    expect(gaps.missingWeight).toBe(true);
+  });
+
+  it('accepts seerfar overlay fields dimension + weight as complete package', () => {
+    const gaps = inspectPackageDimensions(
+      [
+        { name: 'dimension', value: '350x250x25' },
+        { name: 'Вес товара, г', value: '260' },
+      ],
+      { name: 'Блузка Bowiea' },
+    );
+    expect(gaps.missingSize).toBe(false);
+    expect(gaps.missingWeight).toBe(false);
+    expect(gaps.dimensions.length).toBeGreaterThan(0);
+    expect(gaps.dimensions.width).toBeGreaterThan(0);
+    expect(gaps.dimensions.height).toBeGreaterThan(0);
   });
 
   it('keeps Толщина / Размер / Вес as separate labeled specs', () => {
@@ -1828,11 +2156,9 @@ describe('ozon product family', () => {
   });
 });
 
-describe('product review queue', () => {
-  it('keeps chrome-ingested crawled products visible before AI finishes', () => {
-    expect(PRODUCT_REVIEW_QUEUE_STATUSES).toEqual(
-      expect.arrayContaining(['CRAWLED', 'AI_PENDING', 'AI_DONE', 'REVIEW_PENDING']),
-    );
+describe('product catalog after crawl', () => {
+  it('lets crawled products enter the catalog without a review hop', () => {
+    expect(PRODUCT_CATALOG_STATUSES).toEqual(expect.arrayContaining(['CRAWLED', 'APPROVED', 'ON_SHELF']));
   });
 });
 

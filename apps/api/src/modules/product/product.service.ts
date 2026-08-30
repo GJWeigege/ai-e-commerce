@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue, UnrecoverableError } from 'bullmq';
-import { PlatformAccount, ProductStatus, Prisma, ReviewAction, WbListingStatus } from '@prisma/client';
+import { PlatformAccount, ProductStatus, Prisma, WbListingStatus } from '@prisma/client';
 import {
   familySkuIds,
   ProductSkuOption,
@@ -12,7 +12,7 @@ import {
   buildSelectionPrompt,
   parseSelectionOutput,
 } from '@aiecom/llm-core';
-import { collectImageUrls, createWbListingAdapter, isWbVendorCodeConflict, WbHttpError, WbProductDraft } from '@aiecom/platform-core';
+import { collectImageUrls, isWbVendorCodeConflict, WbHttpError, WbListingHints, WbProductDraft } from '@aiecom/platform-core';
 import { computeShelfStock, computeWbShelfPrice, PriceSource, ShelfPriceMode } from './shelf-price';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { PageQueryDto, PageResult } from '../../common/dto/page-query.dto';
@@ -20,7 +20,9 @@ import { ShopAccessService } from '../../common/shop/shop-access.service';
 import { requireTenantId } from '../../common/tenant/tenant-scope';
 import { QUEUE_WB_LISTING } from '../../queues/queue.constants';
 import { AuthUser } from '../auth/auth.types';
-import { canUnlistShopListing, PRODUCT_CATALOG_STATUSES, PRODUCT_REVIEW_QUEUE_STATUSES } from './product-status';
+import { canListProduct, canUnlistShopListing, PRODUCT_CATALOG_STATUSES } from './product-status';
+import { WbCategoryMappingService } from './wb-category-mapping.service';
+import { WbListingAdapterFactory } from './wb-listing-adapter.factory';
 
 export type ShelfOptions = {
   shopIds: string[];
@@ -43,6 +45,10 @@ export type ShelfOptions = {
   fixedDiscountPercent?: number;
   /** 指定要一并上架的 Ozon SKU；空则上架该商品全部 skuOptions */
   skuIds?: string[];
+  /** 上架时指定的 WB 类目，写入映射表并跳过检索 */
+  wbSubjectId?: number;
+  wbSubjectName?: string;
+  sized?: boolean | null;
 };
 
 export type WbListingJob = {
@@ -58,6 +64,9 @@ export type WbListingJob = {
   stock?: number;
   skuIds?: string[];
   skuPrices?: Array<{ skuId: string; listPrice: number }>;
+  wbSubjectId?: number;
+  wbSubjectName?: string;
+  sized?: boolean | null;
 };
 
 @Injectable()
@@ -67,6 +76,8 @@ export class ProductService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly shopAccess: ShopAccessService,
+    private readonly categoryMappings: WbCategoryMappingService,
+    private readonly adapters: WbListingAdapterFactory,
     @Optional() @InjectQueue(QUEUE_WB_LISTING) private readonly listingQueue?: Queue,
   ) {}
 
@@ -75,7 +86,6 @@ export class ProductService {
     query: PageQueryDto & {
       status?: ProductStatus;
       keyword?: string;
-      reviewOnly?: boolean;
       catalogOnly?: boolean;
       wbListingStatus?: WbListingStatus;
       categoryPath?: string;
@@ -90,11 +100,9 @@ export class ProductService {
       tenantId: tid,
       ...(query.status
         ? { status: query.status }
-        : query.reviewOnly
-          ? { status: { in: PRODUCT_REVIEW_QUEUE_STATUSES } }
-          : query.catalogOnly
-            ? { status: { in: PRODUCT_CATALOG_STATUSES } }
-            : {}),
+        : query.catalogOnly
+          ? { status: { in: PRODUCT_CATALOG_STATUSES } }
+          : {}),
       ...(query.wbListingStatus ? { wbListingStatus: query.wbListingStatus } : {}),
       ...(categoryPath
         ? { categoryPath: { contains: categoryPath, mode: 'insensitive' } }
@@ -189,43 +197,49 @@ export class ProductService {
     return updated;
   }
 
-  async review(
-    tenantId: string | null,
-    userId: string,
-    ids: string[],
-    action: Extract<ReviewAction, 'APPROVE' | 'REJECT'>,
-    remark?: string,
-  ) {
+  async remove(tenantId: string | null, ids: string[]): Promise<{ count: number }> {
     const tid = requireTenantId(tenantId);
-    if (ids.length === 0) {
-      throw new BadRequestException('请选择商品');
+    const unique = [...new Set(ids.map((id) => String(id || '').trim()).filter(Boolean))];
+    if (!unique.length) {
+      throw new BadRequestException('请选择要删除的商品');
     }
     const products = await this.prisma.product.findMany({
-      where: { tenantId: tid, id: { in: ids } },
+      where: { id: { in: unique }, tenantId: tid },
+      include: { shopListings: { select: { status: true, wbNmId: true } } },
     });
-    if (products.length !== ids.length) {
-      throw new BadRequestException('存在不属于当前租户的商品');
+    if (products.length !== unique.length) {
+      throw new NotFoundException('部分商品不存在或无权访问');
     }
-
-    const nextStatus: ProductStatus = action === 'APPROVE' ? 'APPROVED' : 'REJECTED';
-    await this.prisma.$transaction(
-      products.flatMap((product) => [
-        this.prisma.product.update({
-          where: { id: product.id },
-          data: { status: nextStatus, remark: remark ?? product.remark },
-        }),
-        this.prisma.productReview.create({
-          data: {
-            tenantId: tid,
-            productId: product.id,
-            reviewerId: userId,
-            action,
-            remark,
-          },
-        }),
-      ]),
+    const busy = products.some(
+      (item) =>
+        item.wbListingStatus === 'QUEUED' ||
+        item.wbListingStatus === 'PROCESSING' ||
+        item.shopListings.some((listing) => listing.status === 'QUEUED' || listing.status === 'PROCESSING'),
     );
-    return { count: products.length };
+    if (busy) {
+      throw new BadRequestException('上架进行中的商品无法删除，请稍后再试');
+    }
+    const liveOnWb = products.some((item) =>
+      item.shopListings.some(
+        (listing) => listing.status === 'LISTED' || (listing.status === 'FAILED' && listing.wbNmId != null),
+      ),
+    );
+    if (liveOnWb) {
+      throw new BadRequestException('已上架或仍有 WB 卡片的商品无法删除，请先下架');
+    }
+    const ordered = await this.prisma.salesOrder.count({
+      where: { tenantId: tid, productId: { in: unique } },
+    });
+    if (ordered > 0) {
+      throw new BadRequestException('已有销售订单的商品无法从库中删除');
+    }
+    await this.prisma.$transaction([
+      this.prisma.aiSelection.updateMany({ where: { tenantId: tid, productId: { in: unique } }, data: { productId: null } }),
+      this.prisma.productReview.deleteMany({ where: { tenantId: tid, productId: { in: unique } } }),
+      this.prisma.productShopListing.deleteMany({ where: { tenantId: tid, productId: { in: unique } } }),
+      this.prisma.product.deleteMany({ where: { tenantId: tid, id: { in: unique } } }),
+    ]);
+    return { count: unique.length };
   }
 
   async shelf(actor: AuthUser, tenantId: string | null, id: string, options: ShelfOptions) {
@@ -267,9 +281,23 @@ export class ProductService {
       return products.length === 1 ? this.loadProduct(tid, products[0].id) : { count: products.length };
     }
 
+    if (options.wbSubjectId && options.wbSubjectName) {
+      const uniquePaths = [...new Set(products.map((item) => item.categoryPath).filter(Boolean))] as string[];
+      await Promise.all(
+        uniquePaths.map((categoryPath) =>
+          this.categoryMappings.upsert(tid, {
+            ozonCategoryPath: categoryPath,
+            wbSubjectId: options.wbSubjectId!,
+            wbSubjectName: options.wbSubjectName!,
+            remark: '上架时指定',
+          }),
+        ),
+      );
+    }
+
     for (const product of products) {
-      if (!['APPROVED', 'OFF_SHELF', 'ON_SHELF'].includes(product.status)) {
-        throw new BadRequestException(`商品 ${product.skuId} 未审核通过，不能上架`);
+      if (!canListProduct(product.status)) {
+        throw new BadRequestException(`商品 ${product.skuId} 不在商品库可上架状态`);
       }
       const priced = computeWbShelfPrice({
         price: Number(product.price),
@@ -304,6 +332,8 @@ export class ProductService {
           stock,
           skuIds,
           skuPrices,
+          wbSubjectId: options.wbSubjectId,
+          wbSubjectName: options.wbSubjectName,
         });
       }
     }
@@ -336,7 +366,7 @@ export class ProductService {
       create: { tenantId: input.tenantId, productId: product.id, shopId: shop.id, status: 'PROCESSING' },
     });
     try {
-      const adapter = this.createListingAdapter(shop);
+      const adapter = this.adapters.create(shop);
       const salePrice = input.price ?? Number(product.price);
       const listPrice = input.listPrice ?? salePrice;
       const discount = input.discount ?? 0;
@@ -345,16 +375,23 @@ export class ProductService {
         { ...product, price: listPrice, stock },
         { skuIds: input.skuIds, skuPrices: input.skuPrices },
       );
-      const listed = await adapter.listProduct(draft);
+      const hints = await this.buildListingHints(input, product.categoryPath, existing?.wbNmId);
+      const listed = await adapter.listProduct(draft, hints);
+      // 类目 + 尺码口径回写映射表：同类目后续商品直接命中，不再检索也不再踩同一个拒卡
+      await this.categoryMappings.remember({
+        tenantId: input.tenantId,
+        categoryPath: product.categoryPath,
+        subjectId: listed.subjectID,
+        subjectName: listed.subjectName,
+        sized: listed.sized,
+        learned: Boolean(listed.repairs?.length),
+      });
       let nmId = listed.nmId;
       let imtId = listed.imtId;
       if (!nmId) {
-        for (let attempt = 0; attempt < 4; attempt += 1) {
-          await this.sleep(8000);
-          const errors = await adapter.listErrors(listed.vendorCode);
-          if (errors.length) {
-            throw new UnrecoverableError(errors.join('；'));
-          }
+        // 适配器已确认无拒卡原因，这里只等 WB 队列把卡片落库
+        for (const delay of [400, 1000, 1800]) {
+          await this.sleep(delay);
           const card = await adapter.findCard(listed.vendorCode);
           if (card?.nmId) {
             nmId = card.nmId;
@@ -371,7 +408,7 @@ export class ProductService {
       });
       if (cancelled) {
         try {
-          await this.createListingAdapter(shop).unlist([nmId]);
+          await adapter.unlist([nmId]);
         } catch (error) {
           this.logger.warn(
             `cancelled listing cleanup failed product=${product.id} shop=${shop.id}: ${
@@ -381,24 +418,23 @@ export class ProductService {
         }
         return;
       }
-      const warnings: string[] = [...(listed.warnings || [])];
-      // 新建卡同步到媒体服务通常需要 1–2 秒，立刻传图会被 400
-      await this.sleep(2000);
-      try {
-        await adapter.saveMedia(nmId, collectImageUrls(draft));
-      } catch (error) {
-        warnings.push(`图片: ${error instanceof Error ? error.message : String(error)}`);
+      const warnings: string[] = [...(listed.repairs || []), ...(listed.warnings || [])];
+      // 图片走 content 域、价格走 discounts-prices 域，是两套独立限流，并行不会互相拖慢
+      const [mediaResult, priceResult] = await Promise.allSettled([
+        adapter.saveMedia(nmId, collectImageUrls(draft)),
+        adapter.setPrice(nmId, listPrice, discount),
+      ]);
+      if (mediaResult.status === 'rejected') {
+        warnings.push(`图片: ${this.errorText(mediaResult.reason)}`);
       }
-      try {
-        await adapter.setPrice(nmId, listPrice, discount);
-      } catch (error) {
-        warnings.push(`价格: ${error instanceof Error ? error.message : String(error)}`);
+      if (priceResult.status === 'rejected') {
+        warnings.push(`价格: ${this.errorText(priceResult.reason)}`);
       }
       try {
         let barcodes = listed.barcodes?.filter(Boolean) || [];
         if (!barcodes.length) {
-          for (let attempt = 0; attempt < 5; attempt += 1) {
-            await this.sleep(4000);
+          for (const delay of [400, 1000]) {
+            await this.sleep(delay);
             const card = await adapter.findCard(listed.vendorCode);
             barcodes = card?.sizes?.flatMap((item) => item.skus).filter(Boolean) || [];
             if (barcodes.length) {
@@ -409,15 +445,13 @@ export class ProductService {
         if (!barcodes.length) {
           throw new Error('卡片条码尚未同步，无法写入库存（请稍后重新上架同步库存）');
         }
-        // 新建卡后库存接口可能尚未就绪，稍等再写
-        await this.sleep(3000);
-        const warehouseId = await adapter.setStocks(barcodes, stock, this.shopWarehouseId(shop));
-        await this.rememberShopWarehouse(shop.id, warehouseId);
+        const warehouseId = await adapter.setStocks(barcodes, stock, this.adapters.warehouseId(shop));
+        await this.adapters.rememberWarehouse(shop.id, warehouseId);
         if (stock <= 0) {
           warnings.push('库存为 0：已同步到 WB，商品仍无法售卖，请在上架弹窗填写库存');
         }
       } catch (error) {
-        warnings.push(`库存: ${error instanceof Error ? error.message : String(error)}`);
+        warnings.push(`库存: ${this.errorText(error)}`);
       }
       await this.prisma.productShopListing.update({
         where: { productId_shopId: { productId: product.id, shopId: shop.id } },
@@ -442,9 +476,10 @@ export class ProductService {
       const unrecoverable =
         error instanceof UnrecoverableError ||
         isWbVendorCodeConflict(message) ||
-        /无法匹配|缺少|未配置|无法解密|重新保存 Token|密文已损坏|必填|не более \d+ символов|Описание|description|бренд.*не найден|безразмерн|Размер и Рос/i.test(
+        /无法匹配|缺少|未配置|无法解密|重新保存 Token|密文已损坏|必填|не более \d+ символов|Описание|description|безразмерн|Размер и Рос/i.test(
           message,
         );
+      await this.categoryMappings.recordFailure(input.tenantId, product.categoryPath, message);
       await this.prisma.productShopListing.updateMany({
         where: { productId: product.id, shopId: shop.id, tenantId: input.tenantId },
         data: {
@@ -517,10 +552,6 @@ export class ProductService {
           finishedAt: new Date(),
         },
       });
-      await this.prisma.product.update({
-        where: { id: input.productId },
-        data: { status: 'REVIEW_PENDING' },
-      });
     } catch (error) {
       await this.prisma.aiSelection.update({
         where: { id: input.aiId },
@@ -530,11 +561,31 @@ export class ProductService {
           finishedAt: new Date(),
         },
       });
-      await this.prisma.product.update({
-        where: { id: input.productId },
-        data: { status: 'AI_DONE' },
-      });
+      await this.touchAiProductStatus(input.productId, 'AI_DONE');
     }
+  }
+
+  /** 上架弹窗指定 > 类目映射表 > 自动检索；已知 nmID 则跳过货号反查与回收站恢复 */
+  private async buildListingHints(
+    input: Pick<WbListingJob, 'tenantId' | 'wbSubjectId' | 'wbSubjectName' | 'sized'>,
+    categoryPath: string | null,
+    knownNmId?: bigint | null,
+  ): Promise<WbListingHints> {
+    const mapping = await this.categoryMappings.resolve(input.tenantId, categoryPath).catch(() => null);
+    const subject =
+      input.wbSubjectId && input.wbSubjectName
+        ? { subjectID: input.wbSubjectId, subjectName: input.wbSubjectName }
+        : mapping?.subject;
+    // 尺码按单件规格判定，不把类目映射里的 sized 当硬开关（同一 Ozon 类目下既有带尺码也有均码）
+    return {
+      ...(subject ? { subject } : {}),
+      knownNmId: knownNmId == null ? null : Number(knownNmId),
+      skipTrashLookup: knownNmId == null,
+    };
+  }
+
+  private errorText(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
   }
 
   private toWbDraft(
@@ -678,6 +729,9 @@ export class ProductService {
       stock?: number;
       skuIds?: string[];
       skuPrices?: Array<{ skuId: string; listPrice: number }>;
+      wbSubjectId?: number;
+      wbSubjectName?: string;
+      sized?: boolean | null;
     },
   ) {
     const existing = await this.prisma.productShopListing.findUnique({
@@ -733,7 +787,7 @@ export class ProductService {
     }
     if (listing.wbNmId) {
       try {
-        await this.createListingAdapter(shop).unlist([Number(listing.wbNmId)]);
+        await this.adapters.create(shop).unlist([Number(listing.wbNmId)]);
       } catch (error) {
         throw new BadRequestException(
           `店铺「${shop.name}」下架失败: ${error instanceof Error ? error.message : String(error)}`,
@@ -795,54 +849,6 @@ export class ProductService {
     return this.detail(tenantId, id);
   }
 
-  private createListingAdapter(shop: PlatformAccount) {
-    return createWbListingAdapter({
-      token: this.shopAccess.decryptShopToken(shop),
-      contentBase: process.env.WB_CONTENT_API_BASE,
-      pricesBase: process.env.WB_PRICES_API_BASE,
-      marketplaceBase: process.env.WB_MARKETPLACE_API_BASE,
-      defaultSubjectId: process.env.WB_DEFAULT_SUBJECT_ID ? Number(process.env.WB_DEFAULT_SUBJECT_ID) : undefined,
-      warehouseId: this.shopWarehouseId(shop),
-      defaultBrand: this.shopBrand(shop),
-      locale: process.env.WB_LOCALE || 'ru',
-    });
-  }
-
-  private shopWarehouseId(shop: PlatformAccount): number | undefined {
-    const extra = this.asShopExtra(shop.extra);
-    const fromShop = Number(extra.warehouseId);
-    if (Number.isFinite(fromShop) && fromShop > 0) {
-      return fromShop;
-    }
-    const fromEnv = Number(process.env.WB_WAREHOUSE_ID);
-    return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : undefined;
-  }
-
-  private shopBrand(shop: PlatformAccount): string | undefined {
-    const extra = this.asShopExtra(shop.extra);
-    const brand = typeof extra.brand === 'string' ? extra.brand.trim() : '';
-    return brand || undefined;
-  }
-
-  private async rememberShopWarehouse(shopId: string, warehouseId: number) {
-    const shop = await this.prisma.platformAccount.findUnique({ where: { id: shopId } });
-    if (!shop) {
-      return;
-    }
-    const extra = this.asShopExtra(shop.extra);
-    if (Number(extra.warehouseId) === warehouseId) {
-      return;
-    }
-    await this.prisma.platformAccount.update({
-      where: { id: shopId },
-      data: { extra: { ...extra, warehouseId } as Prisma.InputJsonValue },
-    });
-  }
-
-  private asShopExtra(value: unknown): Record<string, unknown> {
-    return value && typeof value === 'object' && !Array.isArray(value) ? { ...(value as Record<string, unknown>) } : {};
-  }
-
   private asSpecs(value: unknown): Array<{ name: string; value: string }> {
     if (!Array.isArray(value)) {
       return [];
@@ -858,6 +864,15 @@ export class ProductService {
 
   private sleep(ms: number) {
     return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
+  }
+
+  /** AI 评分不把已入库/已上架商品打回复审队列 */
+  private async touchAiProductStatus(productId: string, next: ProductStatus) {
+    const product = await this.prisma.product.findUnique({ where: { id: productId }, select: { status: true } });
+    if (!product || ['APPROVED', 'ON_SHELF', 'OFF_SHELF'].includes(product.status)) {
+      return;
+    }
+    await this.prisma.product.update({ where: { id: productId }, data: { status: next } });
   }
 
   private asSkuOptions(value: unknown): ProductSkuOption[] {

@@ -8,3 +8,5 @@ export * from './ozon-urls';
 export * from './listing-quota';
 export * from './ozon-html-extract';
 export * from './ozon-widget-parse';
+export * from './ozon-availability';
+export * from './ozon-delivery-widgets';

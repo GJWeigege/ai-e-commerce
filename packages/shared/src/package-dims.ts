@@ -18,9 +18,9 @@ export type PackageDimensionGaps = {
 };
 
 const DIM_KEYS = {
-  length: ['длина', 'length', '长', 'глубина', 'depth', 'длина упаковки'],
-  width: ['ширина', 'width', '宽', 'ширина упаковки'],
-  height: ['высота', 'height', '高', 'толщина', 'thickness', 'высота упаковки'],
+  length: ['длина', 'length', '长', 'глубина', 'depth', 'длина упаковки', 'диаметр дна', 'диаметр', 'diameter'],
+  width: ['ширина', 'width', '宽', 'ширина упаковки', 'диаметр дна', 'диаметр', 'diameter'],
+  height: ['высота стенки', 'высота', 'height', '高', 'толщина', 'thickness', 'высота упаковки'],
   weight: ['вес', 'weight', '重量', 'вес брутто', 'вес товара', 'вес с упаковкой'],
 };
 
@@ -32,6 +32,8 @@ const COMBINED_SIZE_RE =
 /** 净重转毛重：至少加 100g，或净重的 20%，取更大，避免仓内实测超标罚款 */
 const PACK_MIN_KG = 0.1;
 const PACK_RATIO = 0.2;
+/** 商品口径边长转发货口径：每边加 2cm，覆盖纸箱板厚与缠膜。已是包裹口径的边不再叠加 */
+const PACK_EDGE_CM = 2;
 
 export function parseDimensionNumber(
   raw: string,
@@ -158,8 +160,13 @@ function isApparelSizeName(name: string, value = ''): boolean {
   return keyNorm === 'рост' || keyNorm === 'eu' || keyNorm === 'ru';
 }
 
+/** 名称里带 упаковк/брутто/gross = 已经是发货包裹口径，不能再叠加包装余量 */
+function isPackageScopedName(name: string): boolean {
+  return /упаков|брутто|brutto|gross|посылк/i.test(normalizeKey(name));
+}
+
 function isGrossWeightName(name: string): boolean {
-  return /упаков|брутто|brutto|gross/i.test(normalizeKey(name));
+  return isPackageScopedName(name);
 }
 
 function isProductWeightName(name: string): boolean {
@@ -204,9 +211,14 @@ export function mapPackageDimensions(
   const found = { length: 0, width: 0, height: 0, weightBrutto: 0 };
   let productWeight = 0;
   let hasExplicitBrutto = false;
+  let hasExplicitPackageSize = false;
 
   for (const spec of rows) {
     const key = normalizeKey(spec.name);
+    // 锅盖直径 / 涂层厚度不是商品外廓，不能当成长宽高
+    if (/крышк|покрыт/.test(key) && /диаметр|diameter|размер/.test(key)) {
+      continue;
+    }
     if (looksLikeCombinedSize(spec.value) && !DIM_KEYS.weight.some((alias) => key.includes(alias))) {
       continue;
     }
@@ -228,6 +240,9 @@ export function mapPackageDimensions(
         }
       } else {
         found[dim] = Math.max(found[dim], parsed);
+        if (isPackageScopedName(spec.name)) {
+          hasExplicitPackageSize = true;
+        }
       }
     });
   }
@@ -238,7 +253,13 @@ export function mapPackageDimensions(
       if (isApparelSizeName(spec.name, spec.value)) {
         continue;
       }
-      const combined = parseCombinedSize(`${spec.name} ${spec.value}`);
+      const looksLikeTrackingTriple =
+        /^(dimension|volume|габарит)/i.test(normalizeKey(spec.name)) &&
+        !/(см|mm|мм|cm)/i.test(spec.value) &&
+        (String(spec.value).match(/\d+/g) || []).length >= 3;
+      const combined = parseCombinedSize(
+        looksLikeTrackingTriple ? `${spec.name} ${spec.value} mm` : `${spec.name} ${spec.value}`,
+      );
       if (!combined) {
         continue;
       }
@@ -279,10 +300,13 @@ export function mapPackageDimensions(
     weightKg = toGrossKg(found.weightBrutto);
   }
 
+  const toShippingEdge = (value: number) =>
+    Math.max(1, Math.ceil(hasExplicitPackageSize ? value : value + PACK_EDGE_CM));
+
   return {
-    ...(found.length > 0 ? { length: Math.max(1, Math.ceil(found.length)) } : {}),
-    ...(found.width > 0 ? { width: Math.max(1, Math.ceil(found.width)) } : {}),
-    ...(found.height > 0 ? { height: Math.max(1, Math.ceil(found.height)) } : {}),
+    ...(found.length > 0 ? { length: toShippingEdge(found.length) } : {}),
+    ...(found.width > 0 ? { width: toShippingEdge(found.width) } : {}),
+    ...(found.height > 0 ? { height: toShippingEdge(found.height) } : {}),
     ...(weightKg > 0 ? { weightBrutto: weightKg } : {}),
   };
 }

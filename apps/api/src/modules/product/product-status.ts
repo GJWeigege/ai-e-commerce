@@ -1,14 +1,19 @@
 import { ProductStatus, WbListingStatus } from '@prisma/client';
 
-/** 选品复审队列：含采集完成但 AI 尚未出分的记录，避免插件回传后页面空白 */
-export const PRODUCT_REVIEW_QUEUE_STATUSES: ProductStatus[] = [
+/** 商品库：采集完成后即可操作，不再经过选品复审 */
+export const PRODUCT_CATALOG_STATUSES: ProductStatus[] = [
   'CRAWLED',
   'AI_PENDING',
   'AI_DONE',
   'REVIEW_PENDING',
+  'APPROVED',
+  'ON_SHELF',
+  'OFF_SHELF',
 ];
 
-export const PRODUCT_CATALOG_STATUSES: ProductStatus[] = ['APPROVED', 'ON_SHELF', 'OFF_SHELF'];
+export function canListProduct(status: ProductStatus): boolean {
+  return PRODUCT_CATALOG_STATUSES.includes(status);
+}
 
 /** 已建卡、处理中，或失败但已有 nmID（野莓可能残留卡片）才允许下架 */
 export function canUnlistShopListing(listing: { status: WbListingStatus; wbNmId?: bigint | number | null }): boolean {

@@ -22,8 +22,8 @@ const ALL_MENUS: AppMenu[] = [
   { path: '/iam/users', name: '用户管理', permission: 'menu:user' },
   { path: '/iam/shops', name: '店铺管理', permission: 'menu:shop', icon: <ShopOutlined /> },
   { path: '/crawler/tasks', name: '采集任务', permission: 'menu:crawler' },
-  { path: '/product/review', name: '选品复审', permission: 'menu:product-review' },
   { path: '/product/catalog', name: '商品库', permission: 'menu:product' },
+  { path: '/product/category-mapping', name: '类目映射', permission: 'menu:product' },
   { path: '/order', name: '订单中心', permission: 'menu:order' },
   { path: '/warehouse', name: '仓储履约', permission: 'menu:warehouse' },
   { path: '/trace', name: '全链路追踪', permission: 'menu:trace' },
@@ -115,6 +115,7 @@ export function BasicLayout() {
                 onClear={() => {
                   setWorkingTenantId(null);
                   setTenantId(null);
+                  navigate(0);
                 }}
               />,
             ]

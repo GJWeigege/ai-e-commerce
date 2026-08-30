@@ -20,7 +20,6 @@ export const PERMISSIONS: PermissionDef[] = [
   { code: 'menu:user', name: '用户管理', type: 'MENU', resource: '/iam/users', sortOrder: 30 },
   { code: 'menu:shop', name: '店铺管理', type: 'MENU', resource: '/iam/shops', sortOrder: 35 },
   { code: 'menu:crawler', name: '采集任务', type: 'MENU', resource: '/crawler/tasks', sortOrder: 40 },
-  { code: 'menu:product-review', name: '选品复审', type: 'MENU', resource: '/product/review', sortOrder: 50 },
   { code: 'menu:product', name: '商品库', type: 'MENU', resource: '/product/catalog', sortOrder: 60 },
   { code: 'menu:order', name: '订单中心', type: 'MENU', resource: '/order', sortOrder: 70 },
   { code: 'menu:warehouse', name: '仓储履约', type: 'MENU', resource: '/warehouse', sortOrder: 80 },
@@ -51,9 +50,9 @@ export const PERMISSIONS: PermissionDef[] = [
   { code: 'crawler:task:export', name: '导出采集结果', type: 'ACTION', resource: 'crawler:task:export', sortOrder: 430 },
 
   { code: 'product:list', name: '查看商品', type: 'ACTION', resource: 'product:list', sortOrder: 500 },
-  { code: 'product:review', name: '复审商品', type: 'ACTION', resource: 'product:review', sortOrder: 510 },
   { code: 'product:edit', name: '编辑商品', type: 'ACTION', resource: 'product:edit', sortOrder: 520 },
   { code: 'product:shelf', name: '上下架商品', type: 'ACTION', resource: 'product:shelf', sortOrder: 530 },
+  { code: 'product:delete', name: '删除商品', type: 'ACTION', resource: 'product:delete', sortOrder: 540 },
 
   { code: 'order:list', name: '查看订单', type: 'ACTION', resource: 'order:list', sortOrder: 600 },
   { code: 'order:create', name: '创建销售单', type: 'ACTION', resource: 'order:create', sortOrder: 610 },
@@ -68,7 +67,7 @@ export const PERMISSIONS: PermissionDef[] = [
 export const OPERATOR_MODULE_BUNDLES: Record<string, readonly string[]> = {
   'menu:dashboard': ['menu:dashboard'],
   'menu:crawler': ['menu:crawler', 'crawler:task:list', 'crawler:task:create', 'crawler:task:retry', 'crawler:task:export'],
-  'menu:product': ['menu:product', 'product:list', 'product:shelf', 'shop:list'],
+  'menu:product': ['menu:product', 'product:list', 'product:shelf', 'product:delete', 'shop:list'],
   'menu:order': ['menu:order', 'order:list', 'order:create'],
   'menu:warehouse': ['menu:warehouse', 'warehouse:inbound', 'warehouse:outbound'],
   'menu:trace': ['menu:trace'],
@@ -95,13 +94,11 @@ const OPERATOR_CODES = new Set<string>([
 const TENANT_ADMIN_EXTRA = [
   'menu:user',
   'menu:shop',
-  'menu:product-review',
   'user:list',
   'user:create',
   'user:update',
   'user:disable',
   'shop:list',
-  'product:review',
   'product:edit',
   'order:batch',
   'order:alert',

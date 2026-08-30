@@ -9,21 +9,28 @@
       button { margin-right: 6px; margin-bottom: 6px; }
       #log { font-size: 12px; white-space: pre-wrap; max-height: 160px; overflow: auto; }
       .hint { font-size: 12px; color: #555; }
+      .check { display: block; font-size: 12px; margin-bottom: 4px; }
+      .check input { width: auto; margin: 0 4px 0 0; vertical-align: middle; }
       details { font-size: 12px; margin-bottom: 8px; }
       details > summary { cursor: pointer; margin-bottom: 6px; color: #666; }
     </style>
   </head>
   <body>
-    <h4>AIECOM Chrome 采集 <span class="hint">v0.1.3</span></h4>
-    <p class="hint">请先打开 ozon.ru 并完成验证码。改插件后必须在 chrome://extensions 点「重新加载」，再打开商品页点「采集本页」。当前版本 0.1.3。</p>
+    <h4>AIECOM Chrome 采集 <span class="hint" id="extVersion"></span></h4>
+    <p class="hint">请先打开 ozon.ru 并完成验证码。改插件后必须在 chrome://extensions 点「重新加载」，再打开商品页点「采集本页」。当前版本 <span id="extVersionText"></span>。</p>
     <textarea id="token" placeholder="粘贴 JWT Token"></textarea>
     <div id="tenantWrap" hidden>
       <input id="tenant" placeholder="工作租户 ID（仅超管需要）" />
     </div>
     <!-- 暂时隐藏「采集全部规格 SKU」，只采当前页主 skuId -->
+    <label class="check">
+      <input type="checkbox" id="sellerBridge" />
+      卖家后台补数据（FBO/FBS 库存、销量）
+    </label>
+    <p class="hint" id="sellerHint">需登录 seller.ozon.ru；开启后会在后台打开一个卖家标签页。</p>
     <details>
       <summary>高级：API 地址</summary>
-      <input id="api" placeholder="默认线上；本机调试填 localhost" />
+      <input id="api" placeholder="默认 http://localhost:3000/api/v1；线上请填 https://" />
     </details>
     <button id="save">保存</button>
     <button id="start">开始轮询</button>

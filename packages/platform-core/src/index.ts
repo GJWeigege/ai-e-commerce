@@ -31,6 +31,9 @@ export class StubWbAdapter implements IWbAdapter {
 }
 
 export * from './wb-listing.types';
+export * from './wb-rate-limiter';
 export * from './wb-listing.mapper';
 export * from './wb-listing.client';
 export * from './wb-listing.adapter';
+export * from './wb-catalog.store';
+export * from './wb-sdk.transport';

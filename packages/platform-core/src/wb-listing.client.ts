@@ -1,4 +1,6 @@
 import { WbCardRef, WbCardUpdateItem, WbCardUploadItem, WbCharacteristicMeta, WbDirectoryItem, WbSubject } from './wb-listing.types';
+import { createWbSdkApis, readWbSdkErrorBody, WbSdkApis } from './wb-sdk.transport';
+import { WbRateLimiter, wbRateLimiterForToken } from './wb-rate-limiter';
 
 export class WbHttpError extends Error {
   constructor(
@@ -15,11 +17,12 @@ export function isWbVendorCodeConflict(message: string): boolean {
   return /vendor code is used|артикул.*уже|vendorCode.*used/i.test(message);
 }
 
-const tokenGates = new Map<string, Promise<void>>();
-
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+const ERROR_LIST_CACHE_TTL_MS = 1500;
+const errorListCache = new Map<string, { at: number; value: Array<{ vendorCode: string; errors: string[] }> }>();
 
 export type WbHttpClientOptions = {
   token: string;
@@ -27,6 +30,10 @@ export type WbHttpClientOptions = {
   pricesBase?: string;
   marketplaceBase?: string;
   fetchImpl?: typeof fetch;
+  /** 同一 Token 的在途请求上限 */
+  maxConcurrent?: number;
+  /** 同一 Token 相邻请求最小间隔（ms） */
+  minIntervalMs?: number;
 };
 
 export class WbHttpClient {
@@ -35,6 +42,8 @@ export class WbHttpClient {
   private readonly pricesBase: string;
   private readonly marketplaceBase: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly sdk: WbSdkApis;
+  private readonly limiter: WbRateLimiter;
 
   constructor(options: WbHttpClientOptions) {
     this.token = options.token;
@@ -42,12 +51,32 @@ export class WbHttpClient {
     this.pricesBase = (options.pricesBase || 'https://discounts-prices-api.wildberries.ru').replace(/\/$/, '');
     this.marketplaceBase = (options.marketplaceBase || 'https://marketplace-api.wildberries.ru').replace(/\/$/, '');
     this.fetchImpl = options.fetchImpl || fetch;
+    this.limiter = wbRateLimiterForToken(this.token, {
+      maxConcurrent: options.maxConcurrent,
+      minIntervalMs: options.minIntervalMs,
+    });
+    this.sdk = createWbSdkApis({
+      token: this.token,
+      contentBase: this.contentBase,
+      pricesBase: this.pricesBase,
+      marketplaceBase: this.marketplaceBase,
+      fetchImpl: (input, init) => this.sdkFetch(input, init),
+    });
   }
 
   async searchSubjects(name: string, locale = 'ru'): Promise<WbSubject[]> {
-    const json = await this.request<{ data?: Array<Record<string, unknown>> }>(
-      'GET',
-      `${this.contentBase}/content/v2/object/all?${new URLSearchParams({ name, locale, limit: '50' }).toString()}`,
+    const json = await this.sdkCall(
+      async () =>
+        (await this.sdk.content.contentV2ObjectAllGet({
+          name,
+          locale,
+          limit: 50,
+        })) as { data?: Array<Record<string, unknown>> },
+      () =>
+        this.request<{ data?: Array<Record<string, unknown>> }>(
+          'GET',
+          `${this.contentBase}/content/v2/object/all?${new URLSearchParams({ name, locale, limit: '50' }).toString()}`,
+        ),
     );
     return (json.data || [])
       .map((item) => ({
@@ -60,10 +89,51 @@ export class WbHttpClient {
       .filter((item) => item.subjectID && item.subjectName);
   }
 
-  async getCharacteristics(subjectID: number, locale = 'ru'): Promise<WbCharacteristicMeta[]> {
+  async listParentSubjects(locale = 'ru'): Promise<Array<{ parentID: number; parentName: string }>> {
     const json = await this.request<{ data?: Array<Record<string, unknown>> }>(
       'GET',
-      `${this.contentBase}/content/v2/object/charcs/${subjectID}?${new URLSearchParams({ locale }).toString()}`,
+      `${this.contentBase}/content/v2/object/parentAll?${new URLSearchParams({ locale }).toString()}`,
+    ).catch((): { data?: Array<Record<string, unknown>> } => ({}));
+    return (json.data || [])
+      .map((item) => ({
+        parentID: Number(item.id ?? item.parentID ?? item.parentId),
+        parentName: String(item.name ?? item.parentName ?? ''),
+      }))
+      .filter((item) => item.parentID && item.parentName);
+  }
+
+  async listSubjectsByParent(parentID: number, locale = 'ru'): Promise<WbSubject[]> {
+    const json = await this.request<{ data?: Array<Record<string, unknown>> }>(
+      'GET',
+      `${this.contentBase}/content/v2/object/all?${new URLSearchParams({
+        parentID: String(parentID),
+        locale,
+        limit: '1000',
+      }).toString()}`,
+    ).catch((): { data?: Array<Record<string, unknown>> } => ({}));
+    return (json.data || [])
+      .map((item) => ({
+        subjectID: Number(item.subjectID ?? item.subjectId ?? item.id),
+        subjectName: String(item.subjectName ?? item.name ?? ''),
+        parentID: item.parentID == null ? parentID : Number(item.parentID),
+        parentName: item.parentName == null ? undefined : String(item.parentName),
+        isSize: parseOptionalBool(item.isSize ?? item.is_size ?? item.hasSize),
+      }))
+      .filter((item) => item.subjectID && item.subjectName);
+  }
+
+  async getCharacteristics(subjectID: number, locale = 'ru'): Promise<WbCharacteristicMeta[]> {
+    const json = await this.sdkCall(
+      async () =>
+        (await this.sdk.content.contentV2ObjectCharcsSubjectIdGet({
+          subjectId: subjectID,
+          locale,
+        })) as { data?: Array<Record<string, unknown>> },
+      () =>
+        this.request<{ data?: Array<Record<string, unknown>> }>(
+          'GET',
+          `${this.contentBase}/content/v2/object/charcs/${subjectID}?${new URLSearchParams({ locale }).toString()}`,
+        ),
     );
     return (json.data || []).map((item) => ({
       charcID: Number(item.charcID ?? item.id),
@@ -95,7 +165,7 @@ export class WbHttpClient {
   }
 
   /** 按类目拉取 WB 品牌目录，供店铺品牌 / 采集品牌对齐拼写；目录未命中仍提交原名，由 WB 判定 */
-  async getSubjectBrands(subjectID: number, limitPages = 6): Promise<string[]> {
+  async getSubjectBrands(subjectID: number, limitPages = 2): Promise<string[]> {
     const names: string[] = [];
     const collect = (rows: Array<Record<string, unknown> | string>) => {
       for (const item of rows) {
@@ -162,25 +232,51 @@ export class WbHttpClient {
   }
 
   async generateBarcodes(count: number): Promise<string[]> {
-    const json = await this.request<{ data?: string[] }>('POST', `${this.contentBase}/content/v2/barcodes`, { count });
+    const json = await this.sdkCall(
+      async () =>
+        (await this.sdk.content.contentV2BarcodesPost({
+          contentV2BarcodesPostRequest: { count },
+        })) as { data?: string[] },
+      () => this.request<{ data?: string[] }>('POST', `${this.contentBase}/content/v2/barcodes`, { count }),
+    );
     return json.data || [];
   }
 
   async uploadCards(payload: WbCardUploadItem[]): Promise<void> {
-    await this.request('POST', `${this.contentBase}/content/v2/cards/upload`, payload);
+    await this.sdkCall(
+      () =>
+        this.sdk.content.contentV2CardsUploadPost({
+          contentV2CardsUploadPostRequestInner: payload as never,
+        }),
+      () => this.request('POST', `${this.contentBase}/content/v2/cards/upload`, payload),
+    );
+    errorListCache.delete(this.token);
   }
 
   async findCards(vendorCode: string): Promise<WbCardRef[]> {
-    const json = await this.request<{ cards?: Array<Record<string, unknown>> }>(
-      'POST',
-      `${this.contentBase}/content/v2/get/cards/list`,
-      {
-        settings: {
-          sort: { ascending: false },
-          filter: { textSearch: vendorCode, withPhoto: -1 },
-          cursor: { limit: 100 },
-        },
-      },
+    const json = await this.sdkCall(
+      async () =>
+        (await this.sdk.content.contentV2GetCardsListPost({
+          contentV2GetCardsListPostRequest: {
+            settings: {
+              sort: { ascending: false },
+              filter: { textSearch: vendorCode, withPhoto: -1 },
+              cursor: { limit: 100 },
+            },
+          },
+        })) as { cards?: Array<Record<string, unknown>> },
+      () =>
+        this.request<{ cards?: Array<Record<string, unknown>> }>(
+          'POST',
+          `${this.contentBase}/content/v2/get/cards/list`,
+          {
+            settings: {
+              sort: { ascending: false },
+              filter: { textSearch: vendorCode, withPhoto: -1 },
+              cursor: { limit: 100 },
+            },
+          },
+        ),
     );
     return parseCardRefs(json.cards, vendorCode);
   }
@@ -208,6 +304,10 @@ export class WbHttpClient {
   }
 
   async listCardErrors(): Promise<Array<{ vendorCode: string; errors: string[] }>> {
+    const cached = errorListCache.get(this.token);
+    if (cached && Date.now() - cached.at < ERROR_LIST_CACHE_TTL_MS) {
+      return cached.value;
+    }
     const json = await this.request<{
       data?: { items?: Array<Record<string, unknown>> } | Array<Record<string, unknown>>;
     }>('POST', `${this.contentBase}/content/v2/cards/error/list`, {
@@ -235,6 +335,7 @@ export class WbHttpClient {
         }
       }
     }
+    errorListCache.set(this.token, { at: Date.now(), value: result });
     return result;
   }
 
@@ -249,7 +350,14 @@ export class WbHttpClient {
   }
 
   async updateCards(payload: WbCardUpdateItem[]): Promise<void> {
-    await this.request('POST', `${this.contentBase}/content/v2/cards/update`, payload);
+    await this.sdkCall(
+      () =>
+        this.sdk.content.contentV2CardsUpdatePost({
+          contentV2CardsUpdatePostRequestInner: payload as never,
+        }),
+      () => this.request('POST', `${this.contentBase}/content/v2/cards/update`, payload),
+    );
+    errorListCache.delete(this.token);
   }
 
   async saveMedia(nmId: number, urls: string[]): Promise<void> {
@@ -260,7 +368,7 @@ export class WbHttpClient {
     const extension = contentType.includes('png') ? 'png' : contentType.includes('webp') ? 'webp' : 'jpg';
     const payload = new Uint8Array(file.byteLength);
     payload.set(file);
-    await this.runWithTokenGate(async () => {
+    await this.limiter.run(async () => {
       for (let attempt = 0; attempt < 6; attempt += 1) {
         const form = new FormData();
         form.append('uploadfile', new Blob([payload.buffer], { type: contentType || 'image/jpeg' }), `photo-${photoNumber}.${extension}`);
@@ -283,6 +391,7 @@ export class WbHttpClient {
           }
         }
         if (response.status === 429) {
+          this.limiter.notifyThrottled();
           await sleep(readRetryAfter(response) || 15000 * (attempt + 1));
           continue;
         }
@@ -293,22 +402,34 @@ export class WbHttpClient {
             response.status >= 500,
           );
         }
+        this.limiter.notifyOk();
         return;
       }
       throw new WbHttpError('Wildberries HTTP 429', 429, true);
-    });
+    }, 2);
   }
 
   async setPrice(nmId: number, price: number, discount = 0): Promise<void> {
-    await this.request('POST', `${this.pricesBase}/api/v2/upload/task`, {
-      data: [{ nmID: nmId, price, discount }],
-    });
+    await this.sdkCall(
+      () =>
+        this.sdk.prices.apiV2UploadTaskPost({
+          apiV2UploadTaskPostRequest: { data: [{ nmID: nmId, price, discount }] },
+        }),
+      () =>
+        this.request('POST', `${this.pricesBase}/api/v2/upload/task`, {
+          data: [{ nmID: nmId, price, discount }],
+        }),
+    );
   }
 
   async listWarehouses(): Promise<Array<{ id: number; name: string; cargoType?: number; deliveryType?: number }>> {
-    const json = await this.request<Array<Record<string, unknown>> | { data?: Array<Record<string, unknown>> }>(
-      'GET',
-      `${this.marketplaceBase}/api/v3/warehouses`,
+    const json = await this.sdkCall(
+      async () => this.sdk.marketplace.apiV3WarehousesGet() as Promise<Array<Record<string, unknown>> | { data?: Array<Record<string, unknown>> }>,
+      () =>
+        this.request<Array<Record<string, unknown>> | { data?: Array<Record<string, unknown>> }>(
+          'GET',
+          `${this.marketplaceBase}/api/v3/warehouses`,
+        ),
     );
     const rows = Array.isArray(json) ? json : json.data || [];
     return rows
@@ -322,16 +443,30 @@ export class WbHttpClient {
   }
 
   async setStocks(warehouseId: number, stocks: Array<{ sku: string; amount: number }>): Promise<void> {
-    await this.request('PUT', `${this.marketplaceBase}/api/v3/stocks/${warehouseId}`, { stocks });
+    await this.sdkCall(
+      () =>
+        this.sdk.marketplace.apiV3StocksWarehouseIdPut({
+          warehouseId,
+          apiV3StocksWarehouseIdPutRequest: { stocks },
+        }),
+      () => this.request('PUT', `${this.marketplaceBase}/api/v3/stocks/${warehouseId}`, { stocks }),
+    );
   }
 
   async trashCards(nmIDs: number[]): Promise<void> {
-    await this.request('POST', `${this.contentBase}/content/v2/cards/delete/trash`, { nmIDs });
+    await this.sdkCall(
+      () =>
+        this.sdk.content.contentV2CardsDeleteTrashPost({
+          contentV2CardsDeleteTrashPostRequest: { nmIDs },
+        }),
+      () => this.request('POST', `${this.contentBase}/content/v2/cards/delete/trash`, { nmIDs }),
+    );
+    errorListCache.delete(this.token);
   }
 
   private async request<T>(method: string, url: string, body?: unknown): Promise<T> {
-    return this.runWithTokenGate(async () => {
-      await sleep(650);
+    // 写请求占双倍时间片：WB 对 upload/update 的限流额度明显更紧
+    return this.limiter.run(async () => {
       let lastError: Error | null = null;
       for (let attempt = 0; attempt < 8; attempt += 1) {
         try {
@@ -354,9 +489,11 @@ export class WbHttpClient {
             }
           }
           if (response.status === 429) {
+            this.limiter.notifyThrottled();
             await sleep(readRetryAfter(response) || Math.min(60000, 12000 * (attempt + 1)));
             continue;
           }
+          this.limiter.notifyOk();
           if (Array.isArray(parsed)) {
             if (!response.ok) {
               throw new WbHttpError(`Wildberries HTTP ${response.status}`, response.status, response.status >= 500);
@@ -391,21 +528,39 @@ export class WbHttpClient {
         }
       }
       throw lastError || new WbHttpError('Wildberries HTTP 429', 429, true);
-    });
+    }, method === 'GET' ? 1 : 2);
   }
 
-  private async runWithTokenGate<T>(fn: () => Promise<T>): Promise<T> {
-    const prev = tokenGates.get(this.token) || Promise.resolve();
-    let release!: () => void;
-    const current = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    tokenGates.set(this.token, prev.then(() => current));
-    await prev;
+  private async sdkFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const url = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+    const method = String(init?.method || 'GET').toUpperCase();
+    return this.limiter.run(async () => {
+      let last: Response | null = null;
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        const response = await this.fetchImpl(url, init);
+        if (response.status !== 429 && response.status < 500) {
+          this.limiter.notifyOk();
+          return response;
+        }
+        if (response.status === 429) {
+          this.limiter.notifyThrottled();
+        }
+        last = response;
+        await sleep(readRetryAfter(response) || Math.min(30000, 8000 * (attempt + 1)));
+      }
+      return last as Response;
+    }, method === 'GET' ? 1 : 2);
+  }
+
+  private async sdkCall<T>(operation: () => Promise<T>, fallback: () => Promise<T>): Promise<T> {
     try {
-      return await fn();
-    } finally {
-      release();
+      return await operation();
+    } catch (error) {
+      const mapped = await readWbSdkErrorBody(error);
+      if (mapped.status > 0) {
+        throw new WbHttpError(mapped.message, mapped.status, mapped.retryable);
+      }
+      return fallback();
     }
   }
 }

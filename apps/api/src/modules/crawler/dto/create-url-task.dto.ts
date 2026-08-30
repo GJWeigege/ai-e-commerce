@@ -1,4 +1,4 @@
-import { IsArray, IsBoolean, IsEnum, IsNumber, IsOptional, IsString, Max, Min, MinLength } from 'class-validator';
+import { IsArray, IsBoolean, IsEnum, IsIn, IsNumber, IsOptional, IsString, Max, Min, MinLength } from 'class-validator';
 import { CollectorType } from '@prisma/client';
 import { Transform, Type } from 'class-transformer';
 
@@ -63,4 +63,19 @@ export class CreateUrlTaskDto {
   @Transform(({ value }) => value === true || value === 'true')
   @IsBoolean()
   inStockOnly?: boolean;
+
+  @IsOptional()
+  @Transform(({ value }) => value !== false && value !== 'false')
+  @IsBoolean()
+  requireSizeAndWeight?: boolean;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  minStockQuantity?: number;
+
+  @IsOptional()
+  @IsIn(['FBO', 'FBS', 'ALL'])
+  warehouseType?: 'FBO' | 'FBS' | 'ALL';
 }

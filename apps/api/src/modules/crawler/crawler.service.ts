@@ -8,6 +8,7 @@ import {
   mergeCollectorConfig,
   collectFilterMismatch,
   listingHarvestLimit,
+  POLL_STUCK_MS,
   listingQuotaDeficit,
   nextListingBackfill,
   splitListingQueue,
@@ -21,13 +22,13 @@ import {
   toAllowedCollectUrl,
   isSafeHttpsUrl,
 } from '@aiecom/collector-core';
-import { CollectorType, CrawlerItemStatus, Prisma } from '@prisma/client';
+import { CollectorType, CrawlerItemStatus, OzonFulfillment, Prisma } from '@prisma/client';
 import { combineFamilyListings, dedupeVariants, fillSkuOptionsFromVariants, isSameOzonFamily, familySkuIds, keepMainSkuOnly, ProductSkuOption, ProductVariant, StandardProduct } from '@aiecom/shared';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { requireTenantId } from '../../common/tenant/tenant-scope';
 import { PageQueryDto, PageResult, normalizePageQuery } from '../../common/dto/page-query.dto';
 import { QUEUE_AI_SELECTION, QUEUE_CRAWLER_PREPARE, QUEUE_CRAWLER_RETRY } from '../../queues/queue.constants';
-import { assertAgentCanWriteItem, sanitizeTaskForClient } from './crawler-security';
+import { assertAgentCanWriteItem, canCancelCrawlerTask, canDeleteCrawlerTask, CLAIMABLE_TASK_STATUSES, OPEN_ITEM_STATUSES, sanitizeTaskForClient, shouldPreserveTaskStatus } from './crawler-security';
 
 const CHROME_COLLECTOR: CollectorType = 'CHROME_EXT';
 
@@ -281,6 +282,9 @@ export class CrawlerService {
     if (item.status !== 'FAILED') {
       throw new BadRequestException('仅失败条目可重试');
     }
+    if (shouldPreserveTaskStatus(item.task.status)) {
+      throw new BadRequestException('任务已作废或暂停，不能再重试');
+    }
     await this.enqueueRetry(item.id, tid, 0);
     await this.writeLog(tid, item.taskId, item.id, 'INFO', 'retry', '单条重试已入队');
     return { ok: true };
@@ -288,6 +292,10 @@ export class CrawlerService {
 
   async retryFailed(tenantId: string | null, taskId: string) {
     const tid = requireTenantId(tenantId);
+    const task = await this.ensureTask(tid, taskId);
+    if (shouldPreserveTaskStatus(task.status)) {
+      throw new BadRequestException('任务已作废或暂停，不能再重试');
+    }
     const items = await this.prisma.crawlerTaskItem.findMany({
       where: { tenantId: tid, taskId, status: 'FAILED' },
     });
@@ -296,6 +304,45 @@ export class CrawlerService {
     }
     await this.writeLog(tid, taskId, null, 'INFO', 'retry', `批量重试 ${items.length} 条`);
     return { count: items.length };
+  }
+
+  async cancelTask(tenantId: string | null, taskId: string) {
+    const tid = requireTenantId(tenantId);
+    const task = await this.ensureTask(tid, taskId);
+    if (!canCancelCrawlerTask(task.status)) {
+      throw new BadRequestException('当前状态不能作废，已结束的任务请直接删除');
+    }
+    await this.prisma.crawlerTaskItem.updateMany({
+      where: { tenantId: tid, taskId, status: { in: [...OPEN_ITEM_STATUSES] } },
+      data: {
+        status: 'SKIPPED',
+        assignedAgentId: null,
+        failCode: 'TASK_CANCELLED',
+        failReason: '任务已作废',
+      },
+    });
+    const updated = await this.prisma.crawlerTask.update({
+      where: { id: taskId },
+      data: {
+        status: 'CANCELLED',
+        finishedAt: new Date(),
+        errorMessage: '已作废，插件不再领取该任务',
+      },
+    });
+    await this.writeLog(tid, taskId, null, 'WARN', 'cancel', '任务已作废，剩余条目不再领取');
+    await this.refreshTaskStatus(taskId, tid);
+    const latest = await this.prisma.crawlerTask.findFirst({ where: { id: taskId, tenantId: tid } });
+    return sanitizeTaskForClient(latest ?? updated);
+  }
+
+  async deleteTask(tenantId: string | null, taskId: string) {
+    const tid = requireTenantId(tenantId);
+    const task = await this.ensureTask(tid, taskId);
+    if (!canDeleteCrawlerTask(task.status)) {
+      throw new BadRequestException('请先作废进行中的任务，再删除');
+    }
+    await this.prisma.crawlerTask.delete({ where: { id: taskId } });
+    return { ok: true };
   }
 
   async exportCsv(tenantId: string | null, taskId: string): Promise<string> {
@@ -412,8 +459,8 @@ export class CrawlerService {
   }
 
   async failTask(taskId: string, tenantId: string, errorMessage: string) {
-    await this.prisma.crawlerTask.update({
-      where: { id: taskId },
+    await this.prisma.crawlerTask.updateMany({
+      where: { id: taskId, tenantId, status: { not: 'CANCELLED' } },
       data: { status: 'FAILED', errorMessage, finishedAt: new Date() },
     });
     await this.writeLog(tenantId, taskId, null, 'ERROR', 'prepare', errorMessage);
@@ -423,11 +470,12 @@ export class CrawlerService {
   async releaseItemToAgent(itemId: string, tenantId: string) {
     const item = await this.prisma.crawlerTaskItem.findFirst({
       where: { id: itemId, tenantId },
+      include: { task: true },
     });
     if (!item) {
       return;
     }
-    if (item.status === 'SUCCESS') {
+    if (item.status === 'SUCCESS' || shouldPreserveTaskStatus(item.task.status)) {
       return;
     }
     await this.prisma.crawlerTaskItem.update({
@@ -455,6 +503,9 @@ export class CrawlerService {
     });
     if (!item) {
       throw new NotFoundException('采集条目不存在');
+    }
+    if (shouldPreserveTaskStatus(item.task.status)) {
+      throw new BadRequestException('任务已作废或暂停，停止回写');
     }
     if (options?.agentKey) {
       const agent = await this.prisma.collectorAgent.findUnique({
@@ -529,6 +580,9 @@ export class CrawlerService {
       price: product.price,
       currency: product.currency,
       stock: product.stock,
+      warehouseType: toFulfillment(product.warehouseType),
+      fboStock: product.fboStock ?? null,
+      fbsStock: product.fbsStock ?? null,
       specs: product.specs as unknown as Prisma.InputJsonValue,
       categoryPath: product.categoryPath,
       rating: product.rating,
@@ -572,7 +626,7 @@ export class CrawlerService {
         ...listing,
         snapshotId: snapshot.id,
         ...(!existing || ['CRAWLED', 'AI_PENDING', 'AI_DONE', 'REVIEW_PENDING', 'REJECTED'].includes(existing.status)
-          ? { status: 'CRAWLED' as const }
+          ? { status: 'APPROVED' as const }
           : {}),
       },
       create: {
@@ -580,7 +634,7 @@ export class CrawlerService {
         snapshotId: snapshot.id,
         ...productCore,
         ...listing,
-        status: 'CRAWLED',
+        status: 'APPROVED',
       },
     });
 
@@ -601,7 +655,6 @@ export class CrawlerService {
 
     const shouldAi = !existing || ['CRAWLED', 'AI_PENDING', 'AI_DONE', 'REVIEW_PENDING', 'REJECTED'].includes(existing.status);
     if (shouldAi) {
-      await this.prisma.product.update({ where: { id: productRecord.id }, data: { status: 'AI_PENDING' } });
       const existingAi = await this.prisma.aiSelection.findFirst({
         where: { tenantId, productId: productRecord.id },
       });
@@ -621,8 +674,14 @@ export class CrawlerService {
   }
 
   async ingestFailure(itemId: string, tenantId: string, error: unknown, options?: { agentKey?: string }) {
-    const item = await this.prisma.crawlerTaskItem.findFirst({ where: { id: itemId, tenantId } });
+    const item = await this.prisma.crawlerTaskItem.findFirst({
+      where: { id: itemId, tenantId },
+      include: { task: true },
+    });
     if (!item) return;
+    if (shouldPreserveTaskStatus(item.task.status)) {
+      return;
+    }
     if (options?.agentKey) {
       const agent = await this.prisma.collectorAgent.findUnique({
         where: { tenantId_agentKey: { tenantId, agentKey: options.agentKey } },
@@ -652,6 +711,8 @@ export class CrawlerService {
 
     if (canRetry) {
       await this.enqueueRetry(itemId, tenantId, retryBackoffMs(item.retryCount));
+    } else {
+      await this.enqueueListingBackfill(item.taskId, tenantId);
     }
     await this.refreshTaskStatus(item.taskId, tenantId);
   }
@@ -690,11 +751,22 @@ export class CrawlerService {
       throw new BadRequestException('采集端未注册，请先心跳');
     }
 
+    await this.prisma.crawlerTaskItem.updateMany({
+      where: {
+        tenantId: tid,
+        assignedAgentId: agent.id,
+        status: 'RUNNING',
+        updatedAt: { lt: new Date(Date.now() - POLL_STUCK_MS) },
+        task: { status: { in: [...CLAIMABLE_TASK_STATUSES] } },
+      },
+      data: { status: 'PENDING', assignedAgentId: null, failReason: null, failCode: null },
+    });
+
     const item = await this.prisma.crawlerTaskItem.findFirst({
       where: {
         tenantId: tid,
         status: 'PENDING',
-        task: { collectorType: input.type },
+        task: { collectorType: input.type, status: { in: [...CLAIMABLE_TASK_STATUSES] } },
       },
       include: { task: true },
       orderBy: { createdAt: 'asc' },
@@ -717,7 +789,7 @@ export class CrawlerService {
       ...claimed,
       crawlAllSkus: mergeCollectorConfig(item.task.config as Record<string, unknown> | null).crawlAllSkus,
       topN,
-      listingLimit: listingHarvestLimit(topN),
+      listingLimit: listingHarvestLimit(topN), // 按 TOP N 放大候选，过滤后仍能凑满达标条数
     };
   }
 
@@ -739,6 +811,9 @@ export class CrawlerService {
     });
     if (!item) {
       throw new NotFoundException('采集条目不存在');
+    }
+    if (shouldPreserveTaskStatus(item.task.status)) {
+      throw new BadRequestException('任务已作废或暂停，停止展开品类页');
     }
     assertAgentCanWriteItem(item, agent.id);
     if (!isOzonListingUrl(item.sourceUrl)) {
@@ -792,6 +867,13 @@ export class CrawlerService {
   }
 
   async refreshTaskStatus(taskId: string, tenantId: string) {
+    const current = await this.prisma.crawlerTask.findFirst({
+      where: { id: taskId, tenantId },
+      select: { status: true },
+    });
+    if (!current) {
+      return;
+    }
     const items = await this.prisma.crawlerTaskItem.findMany({
       where: { taskId, tenantId },
       select: { status: true, sourceUrl: true, failReason: true },
@@ -841,9 +923,9 @@ export class CrawlerService {
         successCount,
         failCount,
         totalCount: total,
-        status,
-        finishedAt,
-        ...(errorMessage !== undefined ? { errorMessage } : {}),
+        ...(shouldPreserveTaskStatus(current.status)
+          ? {}
+          : { status, finishedAt, ...(errorMessage !== undefined ? { errorMessage } : {}) }),
       },
     });
   }
@@ -851,7 +933,7 @@ export class CrawlerService {
   /** 未达条件的商品不计入 TOP N，从品类页候选池再补一条 */
   private async enqueueListingBackfill(taskId: string, tenantId: string): Promise<number> {
     const task = await this.ensureTask(tenantId, taskId);
-    if (task.mode !== 'CATEGORY_TOP') {
+    if (task.mode !== 'CATEGORY_TOP' || shouldPreserveTaskStatus(task.status)) {
       return 0;
     }
     const topN = task.topN ?? 10;
@@ -887,7 +969,7 @@ export class CrawlerService {
         null,
         'WARN',
         'listing',
-        `候选池已空，仍缺 ${need} 条达标商品（TOP ${topN}）。请提高品类页滚动条数或放宽筛选后重试`,
+        `候选池已空，仍缺 ${need} 条达标商品（TOP ${topN}）。品类页已拆完候选，请放宽筛选或换品类后重试`,
       );
       return 0;
     }
@@ -1098,4 +1180,12 @@ function csvCell(value: string): string {
 /** 明细/导出/计数只看真实商品 URL，品类页本身不算采集结果 */
 function productItemWhere(): Prisma.CrawlerTaskItemWhereInput {
   return { sourceUrl: { contains: '/product/' } };
+}
+
+function toFulfillment(value?: string | null): OzonFulfillment | null {
+  const raw = String(value || '').toUpperCase();
+  if (raw === 'FBO' || raw === 'FBS' || raw === 'MIXED') {
+    return raw;
+  }
+  return null;
 }

@@ -12,24 +12,123 @@ function isListingLocation() {
   return /\/(category|search|highlight)\//i.test(path) || path === '/search' || path === '/search/';
 }
 
-function extractListing(limit) {
-  const cap = Number(limit) > 0 ? Number(limit) : 50;
+const LISTING_END_RE = /вы просмотрели все|просмотрены все товары/i;
+const LISTING_SCROLL_STEP = 700;
+const LISTING_SCROLL_WAIT_MS = 350;
+const LISTING_MAX_STALLS = 16;
+const LISTING_TIME_BUDGET_MS = 90_000;
+const LISTING_MAX_HOPS = 40;
+const FETCH_TIMEOUT_MS = 8_000;
+
+async function fetchJson(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      credentials: 'include',
+      headers: { accept: 'application/json' },
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (_e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function listingSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function pushListingUrl(state, rawPath) {
+  const match = String(rawPath || '').match(/\/product\/(?:[a-z0-9\-._%]+-)?(\d{6,})/i);
+  if (!match || /mock-/i.test(match[0])) return false;
+  if (state.seen[match[1]]) return false;
+  state.seen[match[1]] = true;
+  state.urls.push('https://www.ozon.ru' + match[0].replace(/\/?$/, '/'));
+  return true;
+}
+
+function scanListingDom(state) {
   const html = document.documentElement ? document.documentElement.innerHTML : '';
-  const urls = [];
-  const seen = {};
   const re = /\/product\/(?:[a-z0-9\-._%]+-)?(\d{6,})/gi;
+  let added = 0;
   let match;
   while ((match = re.exec(html))) {
-    if (seen[match[1]] || /mock-/i.test(match[0])) continue;
-    seen[match[1]] = true;
-    const path = match[0].split('?')[0];
-    urls.push('https://www.ozon.ru' + (path.charAt(0) === '/' ? path : '/' + path).replace(/\/?$/, '/'));
-    if (urls.length >= cap) break;
+    if (pushListingUrl(state, match[0])) added += 1;
   }
+  return added;
+}
+
+/**
+ * 品类页翻页只能顺着 nextPage 游标走：游标里的 paginator_token / search_page_state
+ * 决定了后续排序，自己拼 page=N 会拿回第一屏的同一批商品。
+ * 首跳的游标挂在 infiniteVirtualPaginator 组件里，之后挪到响应顶层，两处都要兜。
+ */
+async function collectListingViaApi(state, cap) {
+  let target = location.pathname + location.search;
+  for (let hop = 0; hop < LISTING_MAX_HOPS && state.urls.length < cap; hop += 1) {
+    const json = await fetchJson(
+      'https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=' + encodeURIComponent(target),
+    );
+    if (!json) return;
+    const states = (json && json.widgetStates) || {};
+    let widgetNext = null;
+    for (const key of Object.keys(states)) {
+      let parsed;
+      try {
+        parsed = JSON.parse(states[key]);
+      } catch (_e) {
+        continue;
+      }
+      if (/^(?:tileGrid|searchResults)/i.test(key)) {
+        const items = Array.isArray(parsed.items) ? parsed.items : [];
+        for (const item of items) {
+          const link = item && item.action && item.action.link;
+          if (link) pushListingUrl(state, link);
+          else if (item && /^\d{6,}$/.test(String(item.id || ''))) pushListingUrl(state, '/product/' + item.id + '/');
+          if (state.urls.length >= cap) break;
+        }
+      }
+      if (/paginator/i.test(key) && parsed.nextPage) widgetNext = parsed.nextPage;
+    }
+    const next = (json && json.nextPage) || widgetNext;
+    if (!next) return;
+    target = next;
+  }
+}
+
+/**
+ * 游标接口被风控挡住时的兜底。tileGrid 是虚拟滚动，DOM 里同时只挂载约 32 个 tile，
+ * 滑过去就卸载，所以必须小步滚 + 每步扫一次，跨度太大会让中间的 tile 挂载又卸载却没被读到。
+ */
+async function collectListingViaScroll(state, cap) {
+  const started = Date.now();
+  let stalls = 0;
+  while (state.urls.length < cap && stalls < LISTING_MAX_STALLS && Date.now() - started < LISTING_TIME_BUDGET_MS) {
+    window.scrollBy(0, LISTING_SCROLL_STEP);
+    await listingSleep(LISTING_SCROLL_WAIT_MS);
+    if (scanListingDom(state)) {
+      stalls = 0;
+      continue;
+    }
+    stalls += 1;
+    if (LISTING_END_RE.test(document.body ? document.body.innerText : '')) return;
+  }
+}
+
+async function extractListing(limit) {
+  const cap = Number(limit) > 0 ? Number(limit) : 600;
+  const state = { seen: {}, urls: [] };
+  scanListingDom(state);
+  if (state.urls.length < cap) await collectListingViaApi(state, cap);
+  if (state.urls.length < cap) await collectListingViaScroll(state, cap);
   return {
     kind: 'listing',
-    urls,
-    blocked: isChallengePage() && urls.length === 0,
+    urls: state.urls.slice(0, cap),
+    blocked: isChallengePage() && state.urls.length === 0,
     sourceUrl: location.href,
   };
 }
@@ -290,6 +389,91 @@ function walk(node, visit, depth) {
   Object.keys(node).forEach((key) => walk(node[key], visit, depth + 1));
 }
 
+function asPositiveInt(raw) {
+  const n = typeof raw === 'number' ? raw : Number(String(raw == null ? '' : raw).replace(/\s+/g, '').replace(',', '.'));
+  if (!isFinite(n) || n < 0 || n > 10000000) return undefined;
+  return Math.round(n);
+}
+
+function collectAvailability(trees, fallbackStock) {
+  let fboStock = 0;
+  let fbsStock = 0;
+  let totalStock = 0;
+  let sawFbo = false;
+  let sawFbs = false;
+  const named = (obj, keys) => {
+    for (let i = 0; i < keys.length; i += 1) {
+      if (obj[keys[i]] == null) continue;
+      const value = asPositiveInt(obj[keys[i]]);
+      if (value != null) return value;
+    }
+    return undefined;
+  };
+  trees.forEach((tree) => {
+    walk(tree, (obj) => {
+      const blob = [
+        obj.deliverySchema,
+        obj.availabilityType,
+        obj.warehouseType,
+        obj.fulfillmentType,
+        obj.deliveryType,
+        obj.salesSchema,
+        obj.schema,
+        obj.title,
+        obj.text,
+        obj.name,
+      ]
+        .map((item) => String(item || ''))
+        .join(' ')
+        .toLowerCase()
+        .replace(/ё/g, 'е');
+      const fboFlag = /\bfbo\b/.test(blob) || /склад\s+ozon|со склада ozon|ozon склад/.test(blob);
+      const fbsFlag = /\bfbs\b/.test(blob) || /склад\s+продавц|со склада продавц/.test(blob);
+      const fboNamed = named(obj, ['fboStock', 'stockFbo', 'fboCount', 'fboQty', 'availableFbo']);
+      const fbsNamed = named(obj, ['fbsStock', 'stockFbs', 'fbsCount', 'fbsQty', 'availableFbs']);
+      const generic = named(obj, [
+        'availableStock',
+        'availableCount',
+        'availableAmount',
+        'stockCount',
+        'freeStock',
+        'leftover',
+        'remains',
+        'qty',
+        'quantity',
+        'stock',
+      ]);
+      if (fboNamed != null) {
+        fboStock = Math.max(fboStock, fboNamed);
+        sawFbo = true;
+      }
+      if (fbsNamed != null) {
+        fbsStock = Math.max(fbsStock, fbsNamed);
+        sawFbs = true;
+      }
+      if (generic != null) {
+        if (fboFlag && !fbsFlag) {
+          fboStock = Math.max(fboStock, generic);
+          sawFbo = true;
+        } else if (fbsFlag && !fboFlag) {
+          fbsStock = Math.max(fbsStock, generic);
+          sawFbs = true;
+        } else {
+          totalStock = Math.max(totalStock, generic);
+        }
+      } else if (fboFlag) sawFbo = true;
+      else if (fbsFlag) sawFbs = true;
+    });
+  });
+  const stock = Math.max(totalStock, fboStock, fbsStock, fallbackStock || 0);
+  return {
+    stock,
+    fboStock: fboStock > 0 || sawFbo ? fboStock : undefined,
+    fbsStock: fbsStock > 0 || sawFbs ? fbsStock : undefined,
+    warehouseType: sawFbo && sawFbs ? 'MIXED' : sawFbo ? 'FBO' : sawFbs ? 'FBS' : undefined,
+  };
+}
+
 function isRecommendWidgetKey(key) {
   return /tileGrid|skuGrid|recommend|similar|alsoBuy|boughtTogether|webList|collection|related|catalogMenu|tapTags|horizontalMenu|bigPromo/i.test(
     String(key || ''),
@@ -419,7 +603,14 @@ function addSpec(specs, name, value) {
   const n = specLabel(name);
   const v = specLabel(value);
   if (!n || !v || n === '[object Object]' || v === '[object Object]' || n.length > 80 || v.length > 800) return;
-  if (/^(Длина, мм|Ширина, мм|Высота, мм|Вес товара, г)$/.test(n) && specs.some((item) => item.name === n)) return;
+  if (
+    /^(Длина, мм|Ширина, мм|Высота, мм|Вес товара, г|Длина упаковки, мм|Ширина упаковки, мм|Высота упаковки, мм|Вес брутто, г)$/.test(
+      n,
+    ) &&
+    specs.some((item) => item.name === n)
+  ) {
+    return;
+  }
   if (specs.some((item) => item.name === n && item.value === v)) return;
   specs.push({ name: n, value: v });
 }
@@ -826,6 +1017,7 @@ function extract(payload) {
   const reviewCount = parsePrice(jsonLd.aggregateRating && (jsonLd.aggregateRating.reviewCount || jsonLd.aggregateRating.ratingCount));
   const usable = Boolean(sku && trimmedName && !/^ozon\.?$/i.test(trimmedName));
   if (!usable && isChallengePage()) return { blocked: true };
+  const availability = collectAvailability(trees, price > 0 ? 1 : 0);
 
   return {
     skuId: String(sku || ''),
@@ -838,7 +1030,10 @@ function extract(payload) {
     originalPrice: originalPrice > price ? originalPrice : undefined,
     discountPrice: discountPrice || (originalPrice > price ? price : undefined),
     currency: (offer && offer.priceCurrency) || 'RUB',
-    stock: price > 0 ? 1 : 0,
+    stock: availability.stock,
+    fboStock: availability.fboStock,
+    fbsStock: availability.fbsStock,
+    warehouseType: availability.warehouseType,
     specs,
     variants: alignedVariants,
     categoryPath: crumbs.length ? crumbs.join(' / ') : undefined,
@@ -846,7 +1041,7 @@ function extract(payload) {
     description: description || undefined,
     rating: isFinite(rating) ? rating : undefined,
     reviewCount: reviewCount || undefined,
-    salesCount: reviewCount || 0,
+    salesCount: undefined,
   };
 }
 
@@ -865,25 +1060,26 @@ async function fetchComposerPages() {
     entry + encodeURIComponent(path + '?' + qs.toString()),
     entry + encodeURIComponent(path + '?' + page2.toString()),
     entry + encodeURIComponent('/modal/size-table?product_id=' + sku + '&page_changed=true'),
+    entry + encodeURIComponent('/modal/aspectsNew?product_id=' + sku + '&page_changed=true'),
   ];
   const pages = [];
-  for (let i = 0; i < urls.length; i += 1) {
-    try {
-      const res = await fetch(urls[i], { credentials: 'include', headers: { accept: 'application/json' } });
-      if (!res.ok) continue;
-      const json = await res.json();
-      if (json && !json.incidentId) pages.push(json);
-    } catch (_e) {
-      /* isolated-world fetch is blocked by CORS on some Chrome versions */
-    }
-  }
+  const results = await Promise.all(
+    urls.map(async (url) => {
+      const json = await fetchJson(url);
+      if (json && !json.incidentId) return json;
+      return null;
+    }),
+  );
+  results.forEach((json) => {
+    if (json) pages.push(json);
+  });
   return pages;
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type !== 'EXTRACT') return false;
   const run = async () => {
-    if (isListingLocation()) return extractListing(message.limit || 80);
+    if (isListingLocation()) return extractListing(message.limit || 600);
     const payload = {
       dimSpecs: Array.isArray(message.dimSpecs) ? message.dimSpecs : [],
       extraImageUrls: Array.isArray(message.extraImageUrls) ? message.extraImageUrls : [],

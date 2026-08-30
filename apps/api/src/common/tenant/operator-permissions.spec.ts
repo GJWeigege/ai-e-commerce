@@ -30,7 +30,9 @@ describe('operator module permissions', () => {
 
   it('grants shop:list with product module for shelf shop picker', () => {
     const codes = expandOperatorModules(['menu:product']);
-    expect(codes).toEqual(expect.arrayContaining(['menu:product', 'product:list', 'product:shelf', 'shop:list']));
+    expect(codes).toEqual(
+      expect.arrayContaining(['menu:product', 'product:list', 'product:shelf', 'product:delete', 'shop:list']),
+    );
     expect(codes).not.toContain('shop:create');
     expect(codes).not.toContain('menu:shop');
   });
@@ -50,6 +52,8 @@ describe('operator module permissions', () => {
     expect(tenantPerms).toEqual(permissionCodesForRole('TENANT_ADMIN'));
     expect(tenantPerms).toContain('menu:user');
     expect(tenantPerms).toContain('menu:shop');
+    expect(tenantPerms).not.toContain('menu:product-review');
+    expect(tenantPerms).not.toContain('product:review');
     expect(tenantPerms).not.toContain('tenant:create');
     expect(tenantPerms).not.toContain('shop:create');
     expect(tenantPerms).not.toContain('shop:update');

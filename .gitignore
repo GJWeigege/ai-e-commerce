@@ -21,3 +21,7 @@ prisma/*.db
 
 apps/seerfar-extension/*
 apps/ozon-scout/*
+
+# WB 官方目录缓存（所有租户/店铺共用，首次上架后生成）
+config/wb-catalog/**/*.json
+config/wb-catalog/**/*.tmp

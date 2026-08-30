@@ -1,5 +1,11 @@
 import { PageContainer, ProTable } from '@ant-design/pro-components';
-import { Button, Checkbox, Form, Image, InputNumber, Modal, Radio, Select, Space, Tag, Tooltip, Typography, message } from 'antd';
+import { Button, Checkbox, Form, Image, InputNumber, Modal, Popconfirm, Radio, Select, Space, Tag, Tooltip, Typography, message } from 'antd';
+import { Link } from 'react-router-dom';
+import {
+  fetchCategoryMappingByPath,
+  suggestWbSubjects,
+  type WbSubjectSuggestion,
+} from '../../../services/category-mapping';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ActionType, ProColumns } from '@ant-design/pro-components';
 import {
@@ -8,9 +14,12 @@ import {
   PriceSource,
   ShelfPriceMode,
   WB_LISTING_STATUS_TEXT,
+  canDeleteProduct,
   canShowOffShelfAction,
   canShowOnShelfAction,
   canUnlistListing,
+  deleteProduct,
+  deleteProductsBatch,
   fetchProducts,
   isWbListingBusy,
   linkShelfPriceFields,
@@ -74,6 +83,11 @@ export default function ProductCatalogPage() {
   const [manualSalePrice, setManualSalePrice] = useState<number>();
   const [manualDiscount, setManualDiscount] = useState<number>(0);
   const [manualStock, setManualStock] = useState<number>();
+  const [wbSubjectId, setWbSubjectId] = useState<number>();
+  const [wbSelectedSubject, setWbSelectedSubject] = useState<WbSubjectSuggestion | null>(null);
+  const [wbSuggestions, setWbSuggestions] = useState<WbSubjectSuggestion[]>([]);
+  const [wbSuggesting, setWbSuggesting] = useState(false);
+  const [sharedCategoryPath, setSharedCategoryPath] = useState<string | null>(null);
 
   useEffect(() => {
     fetchShopOptions('WILDBERRIES')
@@ -148,6 +162,67 @@ export default function ProductCatalogPage() {
     shelfTarget,
   ]);
 
+  function keepSelectedSuggestion(list: WbSubjectSuggestion[], selected: WbSubjectSuggestion | null) {
+    if (!selected) {
+      return list;
+    }
+    if (list.some((item) => item.subjectId === selected.subjectId)) {
+      return list;
+    }
+    return [selected, ...list];
+  }
+
+  function resetWbCategoryPicker() {
+    setWbSubjectId(undefined);
+    setWbSelectedSubject(null);
+    setWbSuggestions([]);
+    setSharedCategoryPath(null);
+  }
+
+  async function loadWbCategoryPicker(products: Product[], shopId?: string) {
+    const paths = [...new Set(products.map((item) => item.categoryPath || '').filter(Boolean))];
+    const shared = paths.length === 1 ? paths[0] : null;
+    setSharedCategoryPath(shared);
+    if (!shared) {
+      setWbSubjectId(undefined);
+      setWbSelectedSubject(null);
+      setWbSuggestions([]);
+      return;
+    }
+    const tokenShop = shopId || shops.find((item) => item.status === 'ENABLED' && item.hasToken)?.id;
+    setWbSuggesting(true);
+    try {
+      const [mapping, suggestions] = await Promise.all([
+        fetchCategoryMappingByPath(shared).catch(() => null),
+        tokenShop
+          ? suggestWbSubjects({
+              shopId: tokenShop,
+              ozonCategoryPath: shared,
+              productName: products[0]?.name,
+            }).catch(() => [] as WbSubjectSuggestion[])
+          : Promise.resolve([] as WbSubjectSuggestion[]),
+      ]);
+      const merged = [...suggestions];
+      if (mapping && !merged.some((item) => item.subjectId === mapping.wbSubjectId)) {
+        merged.unshift({
+          subjectId: mapping.wbSubjectId,
+          subjectName: mapping.wbSubjectName,
+          parentName: null,
+        });
+      }
+      const selected = mapping
+        ? { subjectId: mapping.wbSubjectId, subjectName: mapping.wbSubjectName, parentName: null }
+        : null;
+      setWbSuggestions(keepSelectedSuggestion(merged, selected));
+      setWbSubjectId(mapping?.wbSubjectId);
+      setWbSelectedSubject(selected);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '加载 WB 类目失败');
+    } finally {
+      setWbSuggesting(false);
+    }
+  }
+
   function applyManualLink(edited: 'list' | 'sale' | 'discount', next: Partial<{ list: number; sale: number; discount: number }>) {
     const linked = linkShelfPriceFields(edited, {
       listPrice: next.list ?? manualListPrice ?? 1,
@@ -180,13 +255,17 @@ export default function ProductCatalogPage() {
     setManualSalePrice(linked.salePrice);
     setManualDiscount(linked.discount);
     setManualStock(product.stock);
+    resetWbCategoryPicker();
     setShelfTarget({ mode: 'single', product, onShelf });
+    if (onShelf) {
+      void loadWbCategoryPicker([product]);
+    }
   }
 
   function openBatchShelf() {
     const eligible = selectedRows.filter(canShowOnShelfAction);
     if (!eligible.length) {
-      message.warning('请先勾选已通过/已上架/已下架的商品');
+      message.warning('请先勾选可上架的商品');
       return;
     }
     setSelectedShopIds(shops.map((shop) => shop.id));
@@ -202,7 +281,9 @@ export default function ProductCatalogPage() {
     setManualSalePrice(undefined);
     setManualDiscount(0);
     setManualStock(undefined);
+    resetWbCategoryPicker();
     setShelfTarget({ mode: 'batch', products: eligible, onShelf: true });
+    void loadWbCategoryPicker(eligible);
   }
 
   const columns: ProColumns<Product>[] = [
@@ -257,6 +338,13 @@ export default function ProductCatalogPage() {
     },
     { title: '库存', dataIndex: 'stock', search: false },
     {
+      title: '仓库',
+      dataIndex: 'warehouseType',
+      search: false,
+      width: 88,
+      render: (_, row) => row.warehouseType || '-',
+    },
+    {
       title: '尺寸/重量',
       dataIndex: 'packageDims',
       search: false,
@@ -268,7 +356,11 @@ export default function ProductCatalogPage() {
       dataIndex: 'status',
       valueType: 'select',
       valueEnum: {
-        APPROVED: { text: '已通过' },
+        CRAWLED: { text: '已采集' },
+        AI_PENDING: { text: 'AI 处理中' },
+        AI_DONE: { text: 'AI 完成' },
+        REVIEW_PENDING: { text: '已入库' },
+        APPROVED: { text: '已入库' },
         ON_SHELF: { text: '已上架' },
         OFF_SHELF: { text: '已下架' },
       },
@@ -363,6 +455,29 @@ export default function ProductCatalogPage() {
                 </Button>,
               ]
             : []),
+          ...(hasPermission('product:delete') && canDeleteProduct(row)
+            ? [
+                <Popconfirm
+                  key="delete"
+                  title="确认从商品库删除？已上架或仍有 WB 卡片的商品请先下架。此操作不可恢复。"
+                  okText="删除"
+                  okButtonProps={{ danger: true }}
+                  onConfirm={async () => {
+                    try {
+                      await deleteProduct(row.id);
+                      message.success('已删除');
+                      actionRef.current?.reload();
+                    } catch (error) {
+                      message.error(error instanceof Error ? error.message : '删除失败');
+                    }
+                  }}
+                >
+                  <Button type="link" danger>
+                    删除
+                  </Button>
+                </Popconfirm>,
+              ]
+            : []),
         ];
       },
     },
@@ -371,8 +486,10 @@ export default function ProductCatalogPage() {
   return (
     <PageContainer>
       <Typography.Paragraph type="secondary">
-        上架会按采集到的原价 / 优惠价 / 实际销售价计算 WB 划线价与折后价。无尺码类目不会写入 Размер。品牌优先用店铺配置，
-        否则用采集品牌或 NoName，是否通过由 WB 判定。Token 需含 Marketplace 权限。
+        上架会按采集到的原价 / 优惠价 / 实际销售价计算 WB 划线价与折后价。只有采集到 S/M/42
+        这类服装码才会提交 Размер；均码、家居、配件默认不填。Ozon 与 WB 类目不一致时，请在上架弹窗或
+        <Link to="/product/category-mapping"> 类目映射 </Link>
+        中指定正确的 WB 类目。品牌优先用店铺配置，否则用采集品牌或 NoName。Token 需含 Marketplace 权限。
       </Typography.Paragraph>
       <ProTable<Product>
         rowKey="id"
@@ -381,26 +498,58 @@ export default function ProductCatalogPage() {
         headerTitle="商品库"
         search={{ labelWidth: 'auto', defaultCollapsed: false }}
         rowSelection={
-          hasPermission('product:shelf')
+          hasPermission('product:shelf') || hasPermission('product:delete')
             ? {
                 selectedRowKeys,
                 onChange: (keys, rows) => {
                   setSelectedRowKeys(keys as string[]);
                   setSelectedRows(rows);
                 },
-                getCheckboxProps: (row) => ({ disabled: !canShowOnShelfAction(row) }),
+                getCheckboxProps: (row) => ({
+                  disabled: !canShowOnShelfAction(row) && !canDeleteProduct(row),
+                }),
               }
             : undefined
         }
-        toolBarRender={() =>
-          hasPermission('product:shelf')
+        toolBarRender={() => [
+          ...(hasPermission('product:shelf')
             ? [
                 <Button key="batch" type="primary" disabled={!selectedRowKeys.length} onClick={openBatchShelf}>
                   批量上架（{selectedRowKeys.length}）
                 </Button>,
               ]
-            : []
-        }
+            : []),
+          ...(hasPermission('product:delete')
+            ? [
+                <Popconfirm
+                  key="batch-delete"
+                  title={`确认从商品库删除选中的 ${selectedRows.filter(canDeleteProduct).length} 件商品？已上架请先下架。此操作不可恢复。`}
+                  okText="删除"
+                  okButtonProps={{ danger: true, disabled: !selectedRows.filter(canDeleteProduct).length }}
+                  onConfirm={async () => {
+                    const ids = selectedRows.filter(canDeleteProduct).map((item) => item.id);
+                    if (!ids.length) {
+                      message.warning('请先勾选可删除的商品');
+                      return;
+                    }
+                    try {
+                      const result = await deleteProductsBatch(ids);
+                      message.success(`已删除 ${result.count} 件`);
+                      setSelectedRowKeys([]);
+                      setSelectedRows([]);
+                      actionRef.current?.reload();
+                    } catch (error) {
+                      message.error(error instanceof Error ? error.message : '删除失败');
+                    }
+                  }}
+                >
+                  <Button danger disabled={!selectedRows.filter(canDeleteProduct).length}>
+                    批量删除
+                  </Button>
+                </Popconfirm>,
+              ]
+            : []),
+        ]}
         request={async (params) => {
           const data = await fetchProducts({
             current: params.current,
@@ -443,6 +592,10 @@ export default function ProductCatalogPage() {
           setSubmitting(true);
           try {
             if (shelfTarget.mode === 'batch') {
+              const selectedSubject =
+                wbSelectedSubject && wbSelectedSubject.subjectId === wbSubjectId
+                  ? wbSelectedSubject
+                  : wbSuggestions.find((item) => item.subjectId === wbSubjectId);
               await shelfProductsBatch(
                 shelfTarget.products.map((item) => item.id),
                 {
@@ -457,12 +610,18 @@ export default function ProductCatalogPage() {
                   fixedListPrice,
                   fixedSalePrice,
                   fixedDiscountPercent,
+                  wbSubjectId: selectedSubject?.subjectId,
+                  wbSubjectName: selectedSubject?.subjectName,
                 },
               );
               message.success(`已提交 ${shelfTarget.products.length} 件上架任务`);
               setSelectedRowKeys([]);
               setSelectedRows([]);
             } else {
+              const selectedSubject =
+                wbSelectedSubject && wbSelectedSubject.subjectId === wbSubjectId
+                  ? wbSelectedSubject
+                  : wbSuggestions.find((item) => item.subjectId === wbSubjectId);
               const result = await shelfProduct(shelfTarget.product.id, {
                 onShelf: shelfTarget.onShelf,
                 shopIds: selectedShopIds,
@@ -470,6 +629,8 @@ export default function ProductCatalogPage() {
                 salePrice: shelfTarget.onShelf ? manualSalePrice : undefined,
                 discountPercent: shelfTarget.onShelf ? manualDiscount : undefined,
                 stock: shelfTarget.onShelf ? manualStock : undefined,
+                wbSubjectId: shelfTarget.onShelf ? selectedSubject?.subjectId : undefined,
+                wbSubjectName: shelfTarget.onShelf ? selectedSubject?.subjectName : undefined,
               });
               if (shelfTarget.onShelf) {
                 const queued = (result.shopListings || []).some((item) => isWbListingBusy(item.status));
@@ -520,6 +681,53 @@ export default function ProductCatalogPage() {
             />
             {shelfTarget?.onShelf ? (
               <Form layout="vertical">
+                {sharedCategoryPath ? (
+                  <>
+                    <Form.Item
+                      label="WB 类目"
+                      extra={`Ozon：${sharedCategoryPath}。尺码由系统根据规格自动判断，均码/家居不会提交 Размер。`}
+                    >
+                      <Select
+                        showSearch
+                        allowClear
+                        loading={wbSuggesting}
+                        placeholder="选择或搜索 WB 类目（可留空自动匹配）"
+                        value={wbSubjectId}
+                        filterOption={false}
+                        onSearch={(keyword) => {
+                          const shopId =
+                            selectedShopIds[0] || shops.find((item) => item.status === 'ENABLED' && item.hasToken)?.id;
+                          if (shopId && keyword.trim().length >= 2 && sharedCategoryPath) {
+                            void suggestWbSubjects({
+                              shopId,
+                              ozonCategoryPath: sharedCategoryPath,
+                              keyword: keyword.trim(),
+                            })
+                              .then((items) => setWbSuggestions(keepSelectedSuggestion(items, wbSelectedSubject)))
+                              .catch((error: Error) => message.error(error.message));
+                          }
+                        }}
+                        onChange={(value) => {
+                          const found = wbSuggestions.find((item) => item.subjectId === value) || null;
+                          setWbSubjectId(value);
+                          setWbSelectedSubject(found);
+                        }}
+                        options={wbSuggestions.map((item) => ({
+                          label: item.parentName
+                            ? `${item.subjectName}（${item.parentName}）`
+                            : item.subjectName,
+                          value: item.subjectId,
+                        }))}
+                      />
+                    </Form.Item>
+                  </>
+                ) : (
+                  <Typography.Paragraph type="secondary">
+                    所选商品属于多个 Ozon 类目，将分别使用
+                    <Link to="/product/category-mapping"> 类目映射 </Link>
+                    中已维护的 WB 类目；未映射的会自动检索。
+                  </Typography.Paragraph>
+                )}
                 {shelfTarget.mode === 'single' ? (
                   <>
                     <Form.Item label="采集价">

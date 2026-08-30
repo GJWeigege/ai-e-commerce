@@ -44,6 +44,9 @@ export type Product = {
   discountPrice?: string | null;
   currency?: string;
   stock: number;
+  warehouseType?: 'FBO' | 'FBS' | 'MIXED' | null;
+  fboStock?: number | null;
+  fbsStock?: number | null;
   status: string;
   brand?: string | null;
   categoryPath?: string | null;
@@ -92,6 +95,7 @@ export const WB_LISTING_STATUS_TEXT: Record<NonNullable<Product['wbListingStatus
 };
 
 export {
+  canDeleteProduct,
   canShelfProduct,
   canShowOffShelfAction,
   canShowOnShelfAction,
@@ -163,7 +167,6 @@ export function fetchProducts(params: {
   pageSize?: number;
   keyword?: string;
   status?: string;
-  reviewOnly?: boolean;
   catalogOnly?: boolean;
   wbListingStatus?: string;
   categoryPath?: string;
@@ -175,7 +178,6 @@ export function fetchProducts(params: {
   query.set('pageSize', String(params.pageSize ?? 20));
   if (params.keyword) query.set('keyword', params.keyword);
   if (params.status) query.set('status', params.status);
-  if (params.reviewOnly) query.set('reviewOnly', 'true');
   if (params.catalogOnly) query.set('catalogOnly', 'true');
   if (params.wbListingStatus) query.set('wbListingStatus', params.wbListingStatus);
   if (params.categoryPath) query.set('categoryPath', params.categoryPath);
@@ -216,14 +218,13 @@ export type ShelfPayload = {
   fixedSalePrice?: number;
   fixedDiscountPercent?: number;
   skuIds?: string[];
+  wbSubjectId?: number;
+  wbSubjectName?: string;
+  sized?: boolean | null;
 };
 
 export function updateProduct(id: string, body: { name?: string; price?: number; stock?: number; remark?: string }) {
   return request(`/api/v1/products/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
-}
-
-export function reviewProducts(ids: string[], action: 'APPROVE' | 'REJECT', remark?: string) {
-  return request('/api/v1/products/review/batch', { method: 'POST', body: JSON.stringify({ ids, action, remark }) });
 }
 
 export function shelfProduct(id: string, body: ShelfPayload) {
@@ -237,6 +238,17 @@ export function shelfProductsBatch(productIds: string[], body: ShelfPayload) {
   return request<{ count: number }>('/api/v1/products/shelf/batch', {
     method: 'POST',
     body: JSON.stringify({ ...body, productIds }),
+  });
+}
+
+export function deleteProduct(id: string) {
+  return request<{ count: number }>(`/api/v1/products/${id}`, { method: 'DELETE' });
+}
+
+export function deleteProductsBatch(ids: string[]) {
+  return request<{ count: number }>('/api/v1/products/delete/batch', {
+    method: 'POST',
+    body: JSON.stringify({ ids }),
   });
 }
 

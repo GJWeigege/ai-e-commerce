@@ -5,10 +5,48 @@ const DEFAULTS = {
   token: '',
   tenant: '',
   crawlAllSkus: false,
+  sellerBridge: false,
   apiHostVersion: 0,
 };
 
+const SELLER_ORIGIN = 'https://seller.ozon.ru';
+
 let polling = false;
+let pollBusy = false;
+let pollStartedAt = 0;
+let pollGeneration = 0;
+let sellerTabId = 0;
+
+const CRAWL_TABS_KEY = 'crawlTabIds';
+const PRODUCT_COLLECT_MS = 60_000;
+const LISTING_COLLECT_MS = 120_000;
+const POLL_STUCK_MS = 180_000;
+
+async function persistPolling(value) {
+  polling = value;
+  try {
+    if (chrome.storage.session) {
+      await chrome.storage.session.set({ polling: value });
+      return;
+    }
+  } catch {
+    /* session storage 在极旧内核可能不可用 */
+  }
+  await chrome.storage.local.set({ polling: value });
+}
+
+async function readPollingFlag() {
+  try {
+    if (chrome.storage.session) {
+      const stored = await chrome.storage.session.get({ polling: false });
+      if (stored.polling) return true;
+    }
+  } catch {
+    /* fall through */
+  }
+  const stored = await chrome.storage.local.get({ polling: false });
+  return Boolean(stored.polling);
+}
 
 async function settings() {
   const stored = await chrome.storage.local.get(DEFAULTS);
@@ -39,8 +77,14 @@ async function api(path, options) {
   };
   if (cfg.tenant) headers['X-Tenant-Id'] = cfg.tenant;
   const res = await fetch(apiBase + path, { ...options, headers });
-  const body = await res.json();
-  if (body.code !== 0) throw new Error(body.message || 'API error');
+  const text = await res.text();
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw new Error('HTTP ' + res.status);
+  }
+  if (!res.ok || body.code !== 0) throw new Error(body.message || 'HTTP ' + res.status);
   return body.data;
 }
 
@@ -51,6 +95,149 @@ function isOzonHttpsUrl(raw) {
   } catch {
     return false;
   }
+}
+
+function isSellerHttpsUrl(raw) {
+  try {
+    const url = new URL(raw);
+    return url.protocol === 'https:' && url.hostname.toLowerCase() === 'seller.ozon.ru';
+  } catch {
+    return false;
+  }
+}
+
+/** 卖家接口必须同源调用才带 Cookie，所以复用（必要时新开）一个后台 seller 标签页 */
+async function ensureSellerTab() {
+  if (sellerTabId) {
+    const cached = await chrome.tabs.get(sellerTabId).catch(() => null);
+    if (cached && isSellerHttpsUrl(String(cached.url || ''))) return sellerTabId;
+    sellerTabId = 0;
+  }
+  const opened = await chrome.tabs.query({ url: SELLER_ORIGIN + '/*' });
+  const found = opened.find((tab) => tab.id && isSellerHttpsUrl(String(tab.url || '')));
+  if (found) {
+    sellerTabId = found.id;
+    return sellerTabId;
+  }
+  const created = await chrome.tabs.create({ url: SELLER_ORIGIN + '/', active: false });
+  sellerTabId = created.id;
+  await waitTabComplete(sellerTabId, 30_000);
+  return sellerTabId;
+}
+
+async function querySellerInsights(skus) {
+  const cfg = await settings();
+  if (!cfg.sellerBridge) return {};
+  const wanted = (Array.isArray(skus) ? skus : []).map((sku) => String(sku || '')).filter((sku) => /^\d{6,}$/.test(sku));
+  if (!wanted.length) return {};
+  const message = { type: 'SELLER_QUERY', skus: wanted };
+  let payload;
+  try {
+    const tabId = await ensureSellerTab();
+    try {
+      payload = await withTimeout(chrome.tabs.sendMessage(tabId, message), 35_000, '卖家后台查询超时');
+    } catch (_e) {
+      /* 内容脚本可能还没注入（标签页刚开或插件刚重载） */
+    }
+    if (!payload) {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['seller-bridge.js'] });
+      payload = await withTimeout(chrome.tabs.sendMessage(tabId, message), 35_000, '卖家后台查询超时');
+    }
+  } catch (error) {
+    payload = { error: String((error && error.message) || error) };
+  }
+  const items = payload && payload.items && typeof payload.items === 'object' ? payload.items : {};
+  const sample = items[wanted[0]] || items[Object.keys(items)[0]] || {};
+  await chrome.storage.local.set({
+    lastSellerBridge: {
+      at: Date.now(),
+      asked: wanted.length,
+      hits: Object.keys(items).length,
+      error: (payload && payload.error) || '',
+      errors: (payload && payload.errors) || {},
+      rawKeys: Array.isArray(sample.rawKeys) ? sample.rawKeys : [],
+      hasWeight: sample.weight != null,
+      hasDimension: Boolean(sample.dimension || (sample.depth && sample.width && sample.height)),
+      volume: sample.volume || null,
+    },
+  });
+  return items;
+}
+
+function sellerWarehouseType(insight) {
+  const fbo = Number(insight.fboStock) || 0;
+  const fbs = Number(insight.fbsStock) || 0;
+  if (fbo > 0 && fbs > 0) return 'MIXED';
+  if (fbo > 0) return 'FBO';
+  if (fbs > 0) return 'FBS';
+  return '';
+}
+
+/** 品牌/类目只补缺；销量、库存、分仓以卖家后台为准（商品页常把评价数当成销量、有价就写库存 1） */
+function mergeSellerInsight(product, insight) {
+  if (!product || product.kind === 'listing' || !insight || typeof insight !== 'object') {
+    return product;
+  }
+  if (insight.brand && !product.brand) product.brand = insight.brand;
+  if (insight.category && !product.categoryPath) product.categoryPath = insight.category;
+  if (insight.salesCount != null) product.salesCount = insight.salesCount;
+  if (insight.fboStock != null) product.fboStock = insight.fboStock;
+  if (insight.fbsStock != null) product.fbsStock = insight.fbsStock;
+  if (insight.stock != null) product.stock = insight.stock;
+  const warehouse = sellerWarehouseType(insight) || fulfillmentWarehouse(insight.fulfillment);
+  if (warehouse && !product.warehouseType) product.warehouseType = warehouse;
+  const specs = [];
+  if (insight.article) specs.push({ name: 'Артикул производителя', value: insight.article });
+  if (insight.sellerName) specs.push({ name: 'Продавец', value: insight.sellerName });
+  if (insight.volume) specs.push({ name: 'Объем (Ozon аналитика)', value: String(insight.volume) });
+  if (insight.avgDeliveryDays) specs.push({ name: 'Срок доставки', value: String(insight.avgDeliveryDays) + ' дн.' });
+  const dimSpecs = sellerLogisticsSpecs(insight);
+  return mergeDimSpecs(product, specs.concat(dimSpecs));
+}
+
+function fulfillmentWarehouse(raw) {
+  const text = String(raw || '')
+    .toLowerCase()
+    .replace(/ё/g, 'е');
+  if (/\bfbo\b/.test(text) || /склад\s+ozon|со склада ozon|ozon склад/.test(text)) return 'FBO';
+  if (/\bfbs\b/.test(text) || /склад\s+продавц|со склада продавц/.test(text)) return 'FBS';
+  return '';
+}
+
+function sellerLogisticsSpecs(insight) {
+  const specs = [];
+  const parsed = parseSellerDimension(insight && insight.dimension);
+  const depth = Number(insight && insight.depth) || (parsed && parsed.depth) || 0;
+  const width = Number(insight && insight.width) || (parsed && parsed.width) || 0;
+  const height = Number(insight && insight.height) || (parsed && parsed.height) || 0;
+  if (depth > 0 && width > 0 && height > 0) {
+    specs.push(
+      { name: 'Длина упаковки, мм', value: String(Math.round(depth)) },
+      { name: 'Ширина упаковки, мм', value: String(Math.round(width)) },
+      { name: 'Высота упаковки, мм', value: String(Math.round(height)) },
+    );
+  } else if (insight && insight.dimension) {
+    specs.push({ name: 'dimension', value: String(insight.dimension) });
+  }
+  const weight = Number(insight && insight.weight);
+  if (Number.isFinite(weight) && weight > 0) {
+    const grams = weight > 0 && weight < 80 && weight % 1 !== 0 ? Math.round(weight * 1000) : Math.round(weight);
+    if (grams > 0 && grams < 100000) specs.push({ name: 'Вес брутто, г', value: String(grams) });
+  }
+  return specs;
+}
+
+function parseSellerDimension(raw) {
+  const text = String(raw || '').replace(/,/g, '.').replace(/\s+/g, '').trim();
+  const match = text.match(/^(\d+(?:\.\d+)?)[xх×*](\d+(?:\.\d+)?)(?:[xх×*](\d+(?:\.\d+)?))?(?:мм|mm|см|cm)?$/i);
+  if (!match) return null;
+  const asCm = /см|cm/i.test(String(raw || '')) && !/мм|mm/i.test(String(raw || ''));
+  const toMm = (value) => (asCm ? value * 10 : value);
+  const depth = toMm(Number(match[1]));
+  const width = toMm(Number(match[2]));
+  const height = match[3] ? toMm(Number(match[3])) : 0;
+  if (![depth, width, height].every((item) => Number.isFinite(item) && item > 0 && item < 5000)) return null;
+  return { depth, width, height };
 }
 
 function isTrustedExtensionSender(sender) {
@@ -93,6 +280,85 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function withTimeout(promise, ms, message) {
+  const budget = Math.max(1, Math.floor(Number(ms) || 0));
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), budget);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function shouldForceUnlockPoll(input) {
+  if (!input.busy || input.startedAt <= 0) return false;
+  return input.now - input.startedAt >= input.stuckMs;
+}
+
+function isNoReceiverError(error) {
+  return /Receiving end does not exist|Could not establish connection/i.test(String((error && error.message) || error));
+}
+
+async function readCrawlTabIds() {
+  try {
+    if (chrome.storage.session) {
+      const stored = await chrome.storage.session.get({ [CRAWL_TABS_KEY]: [] });
+      if (Array.isArray(stored[CRAWL_TABS_KEY])) return stored[CRAWL_TABS_KEY];
+    }
+  } catch {
+    /* session storage 在极旧内核可能不可用 */
+  }
+  const stored = await chrome.storage.local.get({ [CRAWL_TABS_KEY]: [] });
+  return Array.isArray(stored[CRAWL_TABS_KEY]) ? stored[CRAWL_TABS_KEY] : [];
+}
+
+async function writeCrawlTabIds(ids) {
+  const unique = [...new Set((ids || []).filter((id) => Number(id) > 0))];
+  try {
+    if (chrome.storage.session) {
+      await chrome.storage.session.set({ [CRAWL_TABS_KEY]: unique });
+      return;
+    }
+  } catch {
+    /* fall through */
+  }
+  await chrome.storage.local.set({ [CRAWL_TABS_KEY]: unique });
+}
+
+async function rememberCrawlTab(tabId) {
+  if (!tabId) return;
+  const ids = await readCrawlTabIds();
+  if (!ids.includes(tabId)) ids.push(tabId);
+  await writeCrawlTabIds(ids);
+}
+
+async function forgetCrawlTab(tabId) {
+  if (!tabId) return;
+  const ids = await readCrawlTabIds();
+  await writeCrawlTabIds(ids.filter((id) => id !== tabId));
+}
+
+async function sweepCrawlTabs() {
+  const ids = await readCrawlTabIds();
+  await Promise.all(ids.map((id) => chrome.tabs.remove(id).catch(() => undefined)));
+  await writeCrawlTabIds([]);
+}
+
+async function openCrawlTab(url) {
+  const tab = await chrome.tabs.create({ url, active: false });
+  if (!tab.id) throw new Error('无法打开采集标签页');
+  await chrome.tabs.update(tab.id, { autoDiscardable: false }).catch(() => undefined);
+  await rememberCrawlTab(tab.id);
+  return tab;
+}
+
+async function closeCrawlTab(tabId) {
+  if (!tabId) return;
+  await chrome.tabs.remove(tabId).catch(() => undefined);
+  await forgetCrawlTab(tabId);
+}
+
 function ozonProductPath(tabUrl) {
   try {
     const path = new URL(tabUrl).pathname || '/';
@@ -103,7 +369,18 @@ function ozonProductPath(tabUrl) {
 }
 
 function emptyHarvest(error) {
-  return { dimSpecs: [], imgUrls: [], fetches: [], error: error || '', pageCount: 0, debug: [], charNames: [], meta: {} };
+  return {
+    dimSpecs: [],
+    queuedWidgets: [],
+    attrs: {},
+    imgUrls: [],
+    fetches: [],
+    error: error || '',
+    pageCount: 0,
+    debug: [],
+    charNames: [],
+    meta: {},
+  };
 }
 
 function isProductGalleryUrl(url) {
@@ -155,7 +432,12 @@ function mergeHarvest(product, harvest) {
   if (product.imageUrls[0] && (!product.mainImageUrl || !isProductGalleryUrl(product.mainImageUrl))) {
     product.mainImageUrl = product.imageUrls[0];
   }
-  return product;
+  const deliverySpecs = [];
+  if (meta.deliveryWarehouse) deliverySpecs.push({ name: 'Склад отгрузки', value: String(meta.deliveryWarehouse) });
+  if (meta.deliveryText) deliverySpecs.push({ name: 'Срок доставки', value: String(meta.deliveryText) });
+  const fromDelivery = fulfillmentWarehouse(String(meta.deliveryWarehouse || '') + ' ' + String(meta.deliveryText || ''));
+  if (fromDelivery && !product.warehouseType) product.warehouseType = fromDelivery;
+  return mergeDimSpecs(product, deliverySpecs);
 }
 
 function mergeDimSpecs(product, dimSpecs) {
@@ -182,37 +464,44 @@ async function harvestOzonComposer(tabId, tabUrl) {
     return emptyHarvest();
   }
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      world: 'MAIN',
-      files: ['ozon-harvest.js'],
-    });
+    await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'MAIN',
+        files: ['ozon-harvest.js'],
+      }),
+      15_000,
+      'harvest inject timeout',
+    );
     const injected = await Promise.race([
       chrome.scripting.executeScript({
         target: { tabId },
         world: 'MAIN',
         args: [ozonProductPath(tabUrl), String(tabUrl).match(/(\d{6,})\/?(?:[?#]|$)/)?.[1] || ''],
         func: async (productPath, pageSku) => {
+          const fail = (error) => ({
+            dimSpecs: [],
+            queuedWidgets: [],
+            attrs: {},
+            imgUrls: [],
+            fetches: [],
+            error,
+            pageCount: 0,
+            debug: [],
+            charNames: [],
+            meta: {},
+          });
           try {
             if (typeof window.__aiecomHarvestOzon !== 'function') {
-              return { dimSpecs: [], imgUrls: [], fetches: [], error: 'harvest helper missing', pageCount: 0, debug: [], charNames: [], meta: {} };
+              return fail('harvest helper missing');
             }
             const report = await window.__aiecomHarvestOzon(productPath, pageSku);
             if (!report || typeof report !== 'object') {
-              return { dimSpecs: [], imgUrls: [], fetches: [], error: 'harvest returned ' + String(report), pageCount: 0, debug: [], charNames: [], meta: {} };
+              return fail('harvest returned ' + String(report));
             }
             return JSON.parse(JSON.stringify(report));
           } catch (error) {
-            return {
-              dimSpecs: [],
-              imgUrls: [],
-              fetches: [],
-              error: String(error && error.message ? error.message : error),
-              pageCount: 0,
-              debug: [],
-              charNames: [],
-              meta: {},
-            };
+            return fail(String(error && error.message ? error.message : error));
           }
         },
       }),
@@ -227,6 +516,8 @@ async function harvestOzonComposer(tabId, tabUrl) {
     if (result) {
       return {
         dimSpecs: Array.isArray(result.dimSpecs) ? result.dimSpecs.filter((item) => item && item.name && item.value) : [],
+        queuedWidgets: Array.isArray(result.queuedWidgets) ? result.queuedWidgets.slice(0, 24) : [],
+        attrs: result.attrs && typeof result.attrs === 'object' ? result.attrs : {},
         imgUrls: Array.isArray(result.imgUrls) ? result.imgUrls.filter(Boolean) : [],
         fetches: Array.isArray(result.fetches) ? result.fetches : [],
         error: String(result.error || ''),
@@ -255,6 +546,8 @@ async function extractTab(tabId, limit) {
       at: Date.now(),
       skuId: String(tab.url || '').match(/(\d{6,})\/?(?:[?#]|$)/)?.[1] || '',
       dimSpecs: harvest.dimSpecs,
+      queuedWidgets: harvest.queuedWidgets || [],
+      attrs: harvest.attrs || {},
       fetches: harvest.fetches,
       pageCount: harvest.pageCount,
       error: harvest.error,
@@ -266,21 +559,32 @@ async function extractTab(tabId, limit) {
   });
   const message = {
     type: 'EXTRACT',
-    limit: Number(limit) > 0 ? Number(limit) : 80,
+    limit: Number(limit) > 0 ? Number(limit) : 600,
     dimSpecs: harvest.dimSpecs,
     extraImageUrls: harvest.imgUrls,
   };
+  const extractMs = Number(limit) > 0 ? 110_000 : 25_000;
   let result;
   try {
-    result = await chrome.tabs.sendMessage(tabId, message);
-  } catch (_e) {
-    /* content script may not be injected yet */
+    result = await withTimeout(chrome.tabs.sendMessage(tabId, message), extractMs, '页面提取超时');
+  } catch (error) {
+    if (!isNoReceiverError(error)) throw error;
   }
   if (!result) {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
-    result = await chrome.tabs.sendMessage(tabId, message);
+    await withTimeout(
+      chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }),
+      15_000,
+      '注入内容脚本超时',
+    );
+    result = await withTimeout(chrome.tabs.sendMessage(tabId, message), extractMs, '页面提取超时');
   }
-  return mergeHarvest(result, harvest);
+  const product = mergeHarvest(result, harvest);
+  const sku = String(tab.url || '').match(/(\d{6,})\/?(?:[?#]|$)/)?.[1] || '';
+  if (product && product.kind !== 'listing' && sku) {
+    const insights = await querySellerInsights([sku]).catch(() => ({}));
+    mergeSellerInsight(product, insights[sku]);
+  }
+  return product;
 }
 
 function isUsableProduct(product) {
@@ -301,6 +605,9 @@ function toIngestProduct(product, crawlAllSkus) {
     price: Number(product.price) || 0,
     currency: product.currency || 'RUB',
     stock: Number(product.stock) || 0,
+    fboStock: product.fboStock,
+    fbsStock: product.fbsStock,
+    warehouseType: product.warehouseType,
     specs: Array.isArray(product.specs) ? product.specs : [],
     categoryPath: product.categoryPath,
     rating: product.rating,
@@ -477,7 +784,7 @@ async function enrichProductVariants(product) {
   while (queue.length && bySku.size < 24) {
     const url = queue.shift();
     try {
-      const extra = await collectUrl(url, 2800);
+      const extra = await collectUrl(url, 1200);
       if (!isUsableProduct(extra)) continue;
       extra.sourceUrl = String(extra.sourceUrl || url).split('?')[0];
       extra.variants = extra.variants || [];
@@ -510,18 +817,24 @@ async function collectUrl(sourceUrl, waitMs) {
   if (!isOzonHttpsUrl(sourceUrl)) {
     throw new Error('仅允许打开 ozon.ru 商品页');
   }
-  const tab = await chrome.tabs.create({ url: sourceUrl, active: false });
+  const tab = await openCrawlTab(sourceUrl);
   try {
-    await waitTabComplete(tab.id, 25_000);
-    await sleep(waitMs || 2800);
-    let product = await extractTab(tab.id);
-    if (!isUsableProduct(product)) {
-      await sleep(1500);
-      product = await extractTab(tab.id);
-    }
-    return product;
+    return await withTimeout(
+      (async () => {
+        await waitTabComplete(tab.id, 25_000);
+        await sleep(waitMs || 1200);
+        let product = await extractTab(tab.id);
+        if (!isUsableProduct(product)) {
+          await sleep(600);
+          product = await extractTab(tab.id);
+        }
+        return product;
+      })(),
+      PRODUCT_COLLECT_MS,
+      '商品页采集超时',
+    );
   } finally {
-    if (tab.id) await chrome.tabs.remove(tab.id).catch(() => undefined);
+    await closeCrawlTab(tab.id);
   }
 }
 
@@ -535,74 +848,85 @@ async function collectListing(sourceUrl, limit) {
   if (!isOzonHttpsUrl(sourceUrl)) {
     throw new Error('仅允许打开 ozon.ru 品类/搜索页');
   }
-  const cap = Number(limit) > 0 ? Number(limit) : 36;
-  const tab = await chrome.tabs.create({ url: sourceUrl, active: false });
+  const cap = Number(limit) > 0 ? Number(limit) : 600;
+  const tab = await openCrawlTab(sourceUrl);
   const seen = {};
   const urls = [];
   try {
-    await waitTabComplete(tab.id, 25_000);
-    await sleep(2200);
+    return await withTimeout(
+      (async () => {
+        await waitTabComplete(tab.id, 25_000);
+        await sleep(1000);
 
-    const harvest = async () => {
-      const data = await extractTab(tab.id, cap);
-      for (const url of (data && Array.isArray(data.urls) ? data.urls : [])) {
-        const sku = String(url || '').match(/(\d{6,})\/?$/)?.[1];
-        if (!sku || seen[sku] || /mock-/i.test(url)) continue;
-        seen[sku] = true;
-        urls.push(url);
-      }
-      return data;
-    };
+        const harvest = async () => {
+          const data = await extractTab(tab.id, cap);
+          for (const url of (data && Array.isArray(data.urls) ? data.urls : [])) {
+            const sku = String(url || '').match(/(\d{6,})\/?$/)?.[1];
+            if (!sku || seen[sku] || /mock-/i.test(url)) continue;
+            seen[sku] = true;
+            urls.push(url);
+          }
+          return data;
+        };
 
-    let last = await harvest();
-    for (let i = 0; i < 6 && urls.length < cap && !(last && last.blocked && urls.length === 0); i++) {
-      if (tab.id) {
-        await chrome.scripting
-          .executeScript({
-            target: { tabId: tab.id },
-            func: () => window.scrollTo(0, Math.max(document.body.scrollHeight || 0, window.scrollY + 1400)),
-          })
-          .catch(() => undefined);
-      }
-      await sleep(1300);
-      last = await harvest();
+        let last = await harvest();
+        if (urls.length === 0 && !(last && last.blocked)) {
+          await sleep(600);
+          last = await harvest();
+        }
+
+        return {
+          kind: 'listing',
+          urls: urls.slice(0, cap),
+          blocked: Boolean(last && last.blocked && urls.length === 0),
+          sourceUrl,
+        };
+      })(),
+      LISTING_COLLECT_MS,
+      '品类页采集超时',
+    );
+  } catch (error) {
+    if (urls.length) {
+      return { kind: 'listing', urls: urls.slice(0, cap), blocked: false, sourceUrl };
     }
-
-    for (let page = 2; page <= 4 && urls.length < cap && !(last && last.blocked && urls.length === 0); page++) {
-      const next = new URL(sourceUrl);
-      next.searchParams.set('page', String(page));
-      await chrome.tabs.update(tab.id, { url: next.toString() });
-      await waitTabComplete(tab.id, 25_000);
-      await sleep(2200);
-      last = await harvest();
-      if (tab.id) {
-        await chrome.scripting
-          .executeScript({
-            target: { tabId: tab.id },
-            func: () => window.scrollTo(0, Math.min(2400, document.body.scrollHeight || 2400)),
-          })
-          .catch(() => undefined);
-      }
-      await sleep(1200);
-      last = await harvest();
-    }
-
-    return {
-      kind: 'listing',
-      urls: urls.slice(0, cap),
-      blocked: Boolean(last && last.blocked && urls.length === 0),
-      sourceUrl,
-    };
+    throw error;
   } finally {
-    if (tab.id) await chrome.tabs.remove(tab.id).catch(() => undefined);
+    await closeCrawlTab(tab.id);
   }
 }
 
-async function pollOnce() {
-  const cfg = await settings();
-  const item = await api('/collector/tasks/claim?agentKey=' + encodeURIComponent(cfg.agentKey) + '&type=CHROME_EXT');
-  if (!item) return 'idle';
+async function claimNext(cfg) {
+  return api('/collector/tasks/claim?agentKey=' + encodeURIComponent(cfg.agentKey) + '&type=CHROME_EXT');
+}
 
+async function failClaimed(cfg, item, error) {
+  const text = error instanceof Error ? error.message : String(error || '采集失败');
+  const captcha = /验证码|captcha|challenge/i.test(text);
+  await api('/collector/tasks/' + item.id + '/result', {
+    method: 'POST',
+    body: JSON.stringify({
+      agentKey: cfg.agentKey,
+      success: false,
+      error: text,
+      failCode: captcha ? 'CAPTCHA_DETECTED' : 'COLLECT_FAILED',
+    }),
+  });
+  return captcha ? 'fail-captcha' : 'fail';
+}
+
+async function processClaimed(cfg, item) {
+  try {
+    return await processClaimedUnsafe(cfg, item);
+  } catch (error) {
+    try {
+      return await failClaimed(cfg, item, error);
+    } catch {
+      return 'fail';
+    }
+  }
+}
+
+async function processClaimedUnsafe(cfg, item) {
   if (/\/product\/mock-/i.test(item.sourceUrl)) {
     await api('/collector/tasks/' + item.id + '/result', {
       method: 'POST',
@@ -612,7 +936,7 @@ async function pollOnce() {
   }
 
   if (isListingUrl(item.sourceUrl)) {
-    const listing = await collectListing(item.sourceUrl, item.listingLimit || 36);
+    const listing = await collectListing(item.sourceUrl, item.listingLimit || 600);
     if (listing && listing.blocked) {
       await api('/collector/tasks/' + item.id + '/result', {
         method: 'POST',
@@ -660,16 +984,59 @@ async function pollOnce() {
   return 'ok:' + product.skuId;
 }
 
+async function pollOnce() {
+  if (pollBusy) {
+    if (!shouldForceUnlockPoll({ busy: true, startedAt: pollStartedAt, now: Date.now(), stuckMs: POLL_STUCK_MS })) {
+      return 'busy';
+    }
+    console.warn('[aiecom] poll stuck, closing leftover crawl tabs');
+    pollGeneration += 1;
+    await sweepCrawlTabs();
+    pollBusy = false;
+  }
+  const gen = ++pollGeneration;
+  pollBusy = true;
+  pollStartedAt = Date.now();
+  try {
+    return await pollOnceUnsafe();
+  } finally {
+    if (gen === pollGeneration) {
+      pollBusy = false;
+      pollStartedAt = 0;
+    }
+  }
+}
+
+async function pollOnceUnsafe() {
+  const cfg = await settings();
+  const first = await claimNext(cfg);
+  if (!first) return 'idle';
+  if (isListingUrl(first.sourceUrl) || /\/product\/mock-/i.test(first.sourceUrl)) {
+    return processClaimed(cfg, first);
+  }
+  const second = await claimNext(cfg);
+  if (second && !isListingUrl(second.sourceUrl) && !/\/product\/mock-/i.test(second.sourceUrl)) {
+    const results = await Promise.all([processClaimed(cfg, first), processClaimed(cfg, second)]);
+    return results.join(',');
+  }
+  const firstResult = await processClaimed(cfg, first);
+  if (second) {
+    return firstResult + ',' + (await processClaimed(cfg, second));
+  }
+  return firstResult;
+}
+
 async function pollLoop() {
   if (!polling) return;
+  let result = 'idle';
   try {
     await heartbeat();
-    const result = await pollOnce();
+    result = await pollOnce();
     console.log('[aiecom] poll', result);
   } catch (error) {
     console.warn('[aiecom] poll error', error);
   }
-  if (polling) setTimeout(pollLoop, 5000);
+  if (polling) setTimeout(pollLoop, result === 'idle' ? 2000 : 250);
 }
 
 async function ingestCurrentTab(tabId) {
@@ -708,17 +1075,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
   if (message.type === 'START') {
-    polling = true;
-    chrome.alarms.create('poll', { periodInMinutes: 1 });
-    pollLoop()
+    persistPolling(true)
+      .then(() => sweepCrawlTabs())
+      .then(() => {
+        chrome.alarms.create('poll', { periodInMinutes: 1 });
+        return pollLoop();
+      })
       .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
   if (message.type === 'STOP') {
-    polling = false;
-    chrome.alarms.clear('poll');
-    sendResponse({ ok: true });
+    persistPolling(false)
+      .then(() => chrome.alarms.clear('poll'))
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
   if (message.type === 'INGEST_TAB') {
@@ -741,4 +1112,12 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'poll' && polling) {
     pollOnce().catch((error) => console.warn(error));
   }
+});
+
+readPollingFlag().then(async (active) => {
+  await sweepCrawlTabs();
+  if (!active) return;
+  polling = true;
+  chrome.alarms.create('poll', { periodInMinutes: 1 });
+  pollLoop();
 });

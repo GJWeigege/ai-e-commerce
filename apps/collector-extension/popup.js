@@ -4,8 +4,15 @@ const defaults = {
   api: DEFAULT_COLLECTOR_API,
   token: '',
   tenant: '',
+  sellerBridge: false,
   apiHostVersion: 0,
 };
+
+function paintManifestVersion() {
+  const version = chrome.runtime.getManifest().version;
+  document.getElementById('extVersion').textContent = `v${version}`;
+  document.getElementById('extVersionText').textContent = version;
+}
 
 function refreshIdentity() {
   const token = document.getElementById('token').value;
@@ -24,8 +31,16 @@ async function persist() {
   const identity = refreshIdentity();
   const api = normalizeCollectorApi(document.getElementById('api').value, defaults.api);
   if (!isAllowedCollectorApi(api)) {
-    document.getElementById('log').textContent = '请填写有效的 API 地址。默认已指向线上；本机调试可填 localhost';
+    document.getElementById('log').textContent = '请填写有效的 API 地址。默认本机 localhost:3000；线上请填 https://';
     throw new Error('非法 API 地址');
+  }
+  try {
+    const parsed = new URL(api);
+    if (parsed.protocol === 'http:' && !isLoopbackApiOrigin(`${parsed.origin}/*`)) {
+      document.getElementById('log').textContent = '警告：非本机 HTTP 会明文发送登录 Token，建议改用 https://';
+    }
+  } catch {
+    /* normalizeCollectorApi 已校验 */
   }
   document.getElementById('api').value = api;
   await ensureApiPermission(api);
@@ -35,6 +50,7 @@ async function persist() {
     token: document.getElementById('token').value.trim(),
     tenant: identity.fromJwt ? '' : document.getElementById('tenant').value.trim(),
     crawlAllSkus: false,
+    sellerBridge: document.getElementById('sellerBridge').checked,
   });
   return identity;
 }
@@ -54,25 +70,29 @@ async function ensureApiPermission(api) {
   }
 }
 
+const PRODUCT_DIM_RE = /^(длина, мм|ширина, мм|высота, мм|вес товара|вес, кг|вес$|вес,|масса|диаметр дна|высота стенки)/;
+const PACKAGE_DIM_RE = /длина упаковк|ширина упаковк|высота упаковк|вес брутто|вес в упаков/;
+
+function dimName(item) {
+  return String((item && item.name) || '')
+    .toLowerCase()
+    .replace(/ё/g, 'е');
+}
+
 function harvestSummary(harvest) {
   if (!harvest) return '';
-  const warehouse = Array.isArray(harvest.dimSpecs)
-    ? harvest.dimSpecs.filter((item) => {
-        const name = String(item.name || '')
-          .toLowerCase()
-          .replace(/ё/g, 'е');
-        return /длина, мм|ширина, мм|высота, мм|вес товара|вес, кг|^вес$|^вес,|^масса/.test(name);
-      })
-    : [];
-  const others = Array.isArray(harvest.dimSpecs)
-    ? harvest.dimSpecs.filter((item) => {
-        const name = String(item.name || '')
-          .toLowerCase()
-          .replace(/ё/g, 'е');
-        return !/длина, мм|ширина, мм|высота, мм|вес товара|вес, кг|^вес$|^вес,|^масса/.test(name);
-      })
-    : [];
-  const dims = warehouse.map((item) => item.name + '=' + item.value).join(', ');
+  const specs = Array.isArray(harvest.dimSpecs) ? harvest.dimSpecs : [];
+  const product = specs.filter((item) => PRODUCT_DIM_RE.test(dimName(item)) && !PACKAGE_DIM_RE.test(dimName(item)));
+  const packaging = specs.filter((item) => PACKAGE_DIM_RE.test(dimName(item)));
+  const attrs = harvest.attrs && typeof harvest.attrs === 'object' ? harvest.attrs : {};
+  const attrNames = Object.keys(attrs);
+  const others = specs.filter(
+    (item) =>
+      !PRODUCT_DIM_RE.test(dimName(item)) && !PACKAGE_DIM_RE.test(dimName(item)) && attrNames.indexOf(item.name) < 0,
+  );
+  const dims = product.map((item) => item.name + '=' + item.value).join(', ');
+  const pkgDims = packaging.map((item) => item.name + '=' + item.value).join(', ');
+  const attrLine = attrNames.map((name) => name + '=' + String(attrs[name]).slice(0, 40)).join(', ');
   const extraSpecs = others
     .slice(0, 24)
     .map((item) => item.name + '=' + String(item.value).slice(0, 40))
@@ -96,15 +116,24 @@ function harvestSummary(harvest) {
     meta.description ? '描述=' + String(meta.description).length + '字' : '',
     meta.rating ? '评分=' + meta.rating : '',
     harvest.imgCount ? '图=' + harvest.imgCount : '',
+    meta.deliveryWarehouse ? '发货仓=' + String(meta.deliveryWarehouse).slice(0, 40) : '',
+    meta.deliveryText ? '时效=' + String(meta.deliveryText).slice(0, 40) : '',
   ]
     .filter(Boolean)
     .join(' | ');
   return (
-    '\n包装采集: ' +
-    (dims || '未抽出尺寸/重量') +
-    '\n规格: ' +
+    '\n商品尺寸/重量: ' +
+    (dims || '未抽出') +
+    '\n发货包裹尺寸/毛重: ' +
+    (pkgDims || '未抽出') +
+    '\n上架属性: ' +
+    (attrLine || '未归一化到任何字典字段') +
+    '\n其他规格: ' +
     (extraSpecs || chars || '无') +
     (metaLine ? '\n商品信息: ' + metaLine : '') +
+    (Array.isArray(harvest.queuedWidgets) && harvest.queuedWidgets.length
+      ? '\n排队组件: ' + harvest.queuedWidgets.join(', ')
+      : '') +
     '\nOzon API: pages=' +
     (harvest.pageCount || 0) +
     (fetches ? '\n' + fetches : '') +
@@ -115,8 +144,40 @@ function harvestSummary(harvest) {
   );
 }
 
+const SELLER_ERROR_HINTS = {
+  no_login: '未登录 seller.ozon.ru，请先登录卖家后台',
+  no_data: '该 SKU 在选品分析里没有数据',
+};
+
+function sellerBridgeSummary(state) {
+  if (!state || !state.at || Date.now() - state.at > 600000) return '';
+  const reason = state.error ? SELLER_ERROR_HINTS[state.error] || state.error : '';
+  const perSku = Object.values(state.errors || {})
+    .map((code) => SELLER_ERROR_HINTS[code] || code)
+    .filter((item, index, arr) => arr.indexOf(item) === index)
+    .join(', ');
+  return (
+    '\n卖家后台补数: 命中 ' +
+    (state.hits || 0) +
+    '/' +
+    (state.asked || 0) +
+    (reason ? '（' + reason + '）' : '') +
+    (perSku ? '（' + perSku + '）' : '') +
+    (state.volume != null ? '\n卖家体积: ' + state.volume : '') +
+    (state.hasWeight ? '\n卖家重量: 有' : '') +
+    (state.hasDimension ? '\n卖家尺寸: 有' : '') +
+    (Array.isArray(state.rawKeys) && state.rawKeys.length ? '\n卖家字段: ' + state.rawKeys.join(', ') : '')
+  );
+}
+
 async function load() {
-  const cfg = await chrome.storage.local.get({ ...defaults, lastIngest: null, lastHarvest: null });
+  const cfg = await chrome.storage.local.get({
+    ...defaults,
+    lastIngest: null,
+    lastHarvest: null,
+    lastSellerBridge: null,
+  });
+  document.getElementById('sellerBridge').checked = Boolean(cfg.sellerBridge);
   const api = resolveStoredCollectorApi(cfg.api, cfg.apiHostVersion);
   if (api !== cfg.api || cfg.apiHostVersion !== API_DEFAULT_VERSION) {
     await chrome.storage.local.set({ api, apiHostVersion: API_DEFAULT_VERSION });
@@ -126,18 +187,20 @@ async function load() {
   document.getElementById('tenant').value = cfg.tenant;
   refreshIdentity();
   const harvest = (cfg.lastIngest && cfg.lastIngest.harvest) || cfg.lastHarvest;
+  const sellerLine = sellerBridgeSummary(cfg.lastSellerBridge);
   if (cfg.lastIngest && cfg.lastIngest.at) {
     const ago = Math.round((Date.now() - cfg.lastIngest.at) / 1000);
     if (ago < 600) {
       document.getElementById('log').textContent = cfg.lastIngest.ok
         ? `上次采集成功（${ago}s 前） sku=${cfg.lastIngest.skuId}` +
           harvestSummary(harvest) +
+          sellerLine +
           '\n' +
           JSON.stringify(cfg.lastIngest.data, null, 2)
-        : `上次采集失败（${ago}s 前）: ${cfg.lastIngest.error}` + harvestSummary(harvest);
+        : `上次采集失败（${ago}s 前）: ${cfg.lastIngest.error}` + harvestSummary(harvest) + sellerLine;
     }
   } else if (harvest && harvest.at && Date.now() - harvest.at < 600000) {
-    document.getElementById('log').textContent = '上次包装探测' + harvestSummary(harvest);
+    document.getElementById('log').textContent = '上次包装探测' + harvestSummary(harvest) + sellerLine;
   }
 }
 
@@ -186,11 +249,12 @@ document.getElementById('manual').onclick = async () => {
         return;
       }
       document.getElementById('log').textContent =
-        '已写入选品复审（当前页主 SKU）' + harvestSummary(res.harvest) + '\n' + JSON.stringify(res.data, null, 2);
+        '已写入商品库（当前页主 SKU）' + harvestSummary(res.harvest) + '\n' + JSON.stringify(res.data, null, 2);
     });
   } catch (error) {
     document.getElementById('log').textContent = error instanceof Error ? error.message : String(error);
   }
 };
 
+paintManifestVersion();
 load();

@@ -8,8 +8,8 @@ import RolePage from './pages/iam/roles';
 import UserPage from './pages/iam/users';
 import ShopPage from './pages/iam/shops';
 import CrawlerTaskPage from './pages/crawler/tasks';
-import ProductReviewPage from './pages/product/review';
 import ProductCatalogPage from './pages/product/catalog';
+import CategoryMappingPage from './pages/product/category-mapping';
 import OrderPage from './pages/order';
 import WarehousePage from './pages/warehouse';
 import TracePage from './pages/trace';
@@ -48,8 +48,9 @@ export default function App() {
             <Route path="/iam/users" element={<RequirePermission code="menu:user"><UserPage /></RequirePermission>} />
             <Route path="/iam/shops" element={<RequirePermission code="menu:shop"><ShopPage /></RequirePermission>} />
             <Route path="/crawler/tasks" element={<RequirePermission code="menu:crawler"><CrawlerTaskPage /></RequirePermission>} />
-            <Route path="/product/review" element={<RequirePermission code="menu:product-review"><ProductReviewPage /></RequirePermission>} />
+            <Route path="/product/review" element={<Navigate to="/product/catalog" replace />} />
             <Route path="/product/catalog" element={<RequirePermission code="menu:product"><ProductCatalogPage /></RequirePermission>} />
+            <Route path="/product/category-mapping" element={<RequirePermission code="menu:product"><CategoryMappingPage /></RequirePermission>} />
             <Route path="/order" element={<RequirePermission code="menu:order"><OrderPage /></RequirePermission>} />
             <Route path="/warehouse" element={<RequirePermission code="menu:warehouse"><WarehousePage /></RequirePermission>} />
             <Route path="/trace" element={<RequirePermission code="menu:trace"><TracePage /></RequirePermission>} />

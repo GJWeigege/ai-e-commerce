@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { canShowOffShelfAction, canShowOnShelfAction } from './listing-status';
+import { canDeleteProduct, canShowOffShelfAction, canShowOnShelfAction } from './listing-status';
 import type { Product, ProductShopListing } from './product';
 
 function listing(partial: Partial<ProductShopListing>): ProductShopListing {
@@ -48,6 +48,10 @@ describe('canShowOnShelfAction', () => {
 
   it('shows 上架 after card creation ends without a live listing', () => {
     assert.equal(canShowOnShelfAction(product({ wbListingStatus: 'NONE' })), true);
+    assert.equal(canShowOnShelfAction(product({ status: 'CRAWLED', wbListingStatus: 'NONE' })), true);
+    assert.equal(canShowOnShelfAction(product({ status: 'AI_PENDING', wbListingStatus: 'NONE' })), true);
+    assert.equal(canShowOnShelfAction(product({ status: 'REVIEW_PENDING', wbListingStatus: 'NONE' })), true);
+    assert.equal(canShowOnShelfAction(product({ status: 'REJECTED', wbListingStatus: 'NONE' })), false);
     assert.equal(
       canShowOnShelfAction(
         product({
@@ -111,6 +115,55 @@ describe('canShowOffShelfAction', () => {
         product({
           wbListingStatus: 'FAILED',
           shopListings: [listing({ status: 'FAILED', wbNmId: null })],
+        }),
+      ),
+      false,
+    );
+  });
+});
+
+describe('canDeleteProduct', () => {
+  it('allows catalog delete when listing is idle and not live on WB', () => {
+    assert.equal(canDeleteProduct(product({ status: 'APPROVED', wbListingStatus: 'NONE' })), true);
+  });
+
+  it('blocks catalog delete while listed or a WB nmID remains', () => {
+    assert.equal(
+      canDeleteProduct(
+        product({
+          status: 'ON_SHELF',
+          wbListingStatus: 'LISTED',
+          shopListings: [listing({ status: 'LISTED', wbNmId: 1 })],
+        }),
+      ),
+      false,
+    );
+    assert.equal(
+      canDeleteProduct(
+        product({
+          wbListingStatus: 'FAILED',
+          shopListings: [listing({ status: 'FAILED', wbNmId: 1 })],
+        }),
+      ),
+      false,
+    );
+  });
+
+  it('blocks catalog delete while card creation is queued or processing', () => {
+    assert.equal(
+      canDeleteProduct(
+        product({
+          wbListingStatus: 'QUEUED',
+          shopListings: [listing({ status: 'QUEUED' })],
+        }),
+      ),
+      false,
+    );
+    assert.equal(
+      canDeleteProduct(
+        product({
+          wbListingStatus: 'PROCESSING',
+          shopListings: [listing({ status: 'PROCESSING' })],
         }),
       ),
       false,

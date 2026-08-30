@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Post,
@@ -146,6 +147,9 @@ export class CrawlerController {
       minPrice?: string;
       maxPrice?: string;
       inStockOnly?: string | boolean;
+      requireSizeAndWeight?: string | boolean;
+      minStockQuantity?: string;
+      warehouseType?: string;
     },
   ) {
     if (!file) {
@@ -161,12 +165,21 @@ export class CrawlerController {
       config: {
         proxies: body.proxy ? body.proxy.split(',').map((item) => item.trim()).filter(Boolean) : [],
         crawlAllSkus: body.crawlAllSkus === true || body.crawlAllSkus === 'true',
-        minRating: body.minRating,
-        minReviewCount: body.minReviewCount,
-        minSalesCount: body.minSalesCount,
-        minPrice: body.minPrice,
-        maxPrice: body.maxPrice,
-        inStockOnly: body.inStockOnly === true || body.inStockOnly === 'true',
+        ...collectFiltersFromDto({
+          minRating: body.minRating != null && body.minRating !== '' ? Number(body.minRating) : undefined,
+          minReviewCount: body.minReviewCount != null && body.minReviewCount !== '' ? Number(body.minReviewCount) : undefined,
+          minSalesCount: body.minSalesCount != null && body.minSalesCount !== '' ? Number(body.minSalesCount) : undefined,
+          minPrice: body.minPrice != null && body.minPrice !== '' ? Number(body.minPrice) : undefined,
+          maxPrice: body.maxPrice != null && body.maxPrice !== '' ? Number(body.maxPrice) : undefined,
+          inStockOnly: body.inStockOnly === true || body.inStockOnly === 'true',
+          requireSizeAndWeight: body.requireSizeAndWeight !== false && body.requireSizeAndWeight !== 'false',
+          minStockQuantity:
+            body.minStockQuantity != null && body.minStockQuantity !== '' ? Number(body.minStockQuantity) : undefined,
+          warehouseType:
+            body.warehouseType === 'FBO' || body.warehouseType === 'FBS' || body.warehouseType === 'ALL'
+              ? body.warehouseType
+              : 'ALL',
+        }),
       } as Record<string, unknown>,
     });
   }
@@ -175,6 +188,18 @@ export class CrawlerController {
   @RequirePermissions('crawler:task:retry')
   retryFailed(@CurrentTenantId() tenantId: string | null, @Param('id') id: string) {
     return this.crawlerService.retryFailed(tenantId, id);
+  }
+
+  @Post(':id/cancel')
+  @RequirePermissions('crawler:task:retry')
+  cancel(@CurrentTenantId() tenantId: string | null, @Param('id') id: string) {
+    return this.crawlerService.cancelTask(tenantId, id);
+  }
+
+  @Delete(':id')
+  @RequirePermissions('crawler:task:create')
+  remove(@CurrentTenantId() tenantId: string | null, @Param('id') id: string) {
+    return this.crawlerService.deleteTask(tenantId, id);
   }
 
   @Post('items/:itemId/retry')

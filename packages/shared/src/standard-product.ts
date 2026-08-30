@@ -26,6 +26,12 @@ export type ProductSkuOption = {
   options: Record<string, string>;
 };
 
+/** Ozon 履约仓：FBO=Ozon 仓，FBS=卖家仓，MIXED=两边都有货 */
+export type OzonFulfillment = 'FBO' | 'FBS' | 'MIXED';
+
+/** 批量采集任务的仓库筛选；ALL 表示不限制 */
+export type OzonWarehouseFilter = 'FBO' | 'FBS' | 'ALL';
+
 export type StandardProduct = {
   skuId: string;
   name: string;
@@ -41,6 +47,11 @@ export type StandardProduct = {
   discountPrice?: number;
   currency: string;
   stock: number;
+  /** 页面解析到的 FBO 库存；未知则为 undefined */
+  fboStock?: number;
+  /** 页面解析到的 FBS 库存；未知则为 undefined */
+  fbsStock?: number;
+  warehouseType?: OzonFulfillment;
   specs: ProductSpec[];
   variants?: ProductVariant[];
   skuOptions?: ProductSkuOption[];

@@ -1,4 +1,4 @@
-import { IsArray, IsBoolean, IsEnum, IsNumber, IsOptional, IsString, ValidateNested } from 'class-validator';
+import { IsArray, IsBoolean, IsEnum, IsIn, IsNumber, IsOptional, IsString, ValidateNested } from 'class-validator';
 import { Type } from 'class-transformer';
 import { CollectorType } from '@prisma/client';
 
@@ -28,6 +28,20 @@ export class AgentProductDto {
   @Type(() => Number)
   @IsNumber()
   stock: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  fboStock?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  fbsStock?: number;
+
+  @IsOptional()
+  @IsIn(['FBO', 'FBS', 'MIXED'])
+  warehouseType?: 'FBO' | 'FBS' | 'MIXED';
 
   @IsOptional()
   @Type(() => Number)

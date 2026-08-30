@@ -1,4 +1,4 @@
-import { IsBoolean, IsEnum, IsInt, IsNumber, IsOptional, IsString, Max, Min, MinLength } from 'class-validator';
+import { IsBoolean, IsEnum, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, Min, MinLength } from 'class-validator';
 import { CollectorType } from '@prisma/client';
 import { Transform, Type } from 'class-transformer';
 
@@ -73,4 +73,19 @@ export class CreateCategoryTaskDto {
   @Transform(({ value }) => value === true || value === 'true')
   @IsBoolean()
   inStockOnly?: boolean;
+
+  @IsOptional()
+  @Transform(({ value }) => value !== false && value !== 'false')
+  @IsBoolean()
+  requireSizeAndWeight?: boolean;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  minStockQuantity?: number;
+
+  @IsOptional()
+  @IsIn(['FBO', 'FBS', 'ALL'])
+  warehouseType?: 'FBO' | 'FBS' | 'ALL';
 }

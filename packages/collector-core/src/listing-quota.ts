@@ -1,12 +1,13 @@
 import { pickOzonProductUrls } from './ozon-urls';
 
 const MAX_TOP_N = 50;
-const MAX_HARVEST = 80;
+const MAX_HARVEST = 600;
+const HARVEST_MULTIPLIER = 12;
 
-/** 品类页要多拆一些链接，未达条件时才能补齐到 TOP N */
+/** 品类页要多拆候选：详情过滤后达标率可能只有约一成，才能补齐到 TOP N */
 export function listingHarvestLimit(topN: number): number {
   const n = clampTopN(topN);
-  return Math.min(MAX_HARVEST, Math.max(n * 3, n + 16));
+  return Math.min(MAX_HARVEST, Math.max(n * HARVEST_MULTIPLIER, n + 16));
 }
 
 export function splitListingQueue(
@@ -61,5 +62,5 @@ function clampTopN(topN: number): number {
 }
 
 function uniqueProductUrls(raw: string[]): string[] {
-  return pickOzonProductUrls(raw, MAX_HARVEST);
+  return pickOzonProductUrls(raw, Math.max(MAX_HARVEST, raw.length));
 }
