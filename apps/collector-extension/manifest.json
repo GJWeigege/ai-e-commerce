@@ -32,13 +32,13 @@
   "content_scripts": [
     {
       "matches": ["https://www.ozon.ru/*", "https://ozon.ru/*"],
-      "js": ["ozon-harvest.js"],
+      "js": ["seerfar-overlay.js", "ozon-harvest.js"],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
       "matches": ["https://www.ozon.ru/*", "https://ozon.ru/*"],
-      "js": ["content.js"]
+      "js": ["seerfar-overlay.js", "content.js"]
     },
     {
       "matches": ["https://seller.ozon.ru/*"],

@@ -10,3 +10,4 @@ export * from './ozon-html-extract';
 export * from './ozon-widget-parse';
 export * from './ozon-availability';
 export * from './ozon-delivery-widgets';
+export * from './seerfar-overlay';

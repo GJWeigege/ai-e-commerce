@@ -14,6 +14,7 @@
     "@aiecom/llm-core": "workspace:*",
     "@aiecom/platform-core": "workspace:*",
     "@aiecom/shared": "workspace:*",
+    "@cursor/sdk": "^1.0.30",
     "@nestjs/bullmq": "^11.0.3",
     "@nestjs/common": "^11.1.5",
     "@nestjs/config": "^4.0.2",

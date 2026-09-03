@@ -111,6 +111,9 @@ function harvestSummary(harvest) {
   const meta = harvest.meta && typeof harvest.meta === 'object' ? harvest.meta : {};
   const metaLine = [
     meta.brand ? '品牌=' + meta.brand : '',
+    meta.stock ? '库存=' + meta.stock : '',
+    meta.warehouseType ? '仓=' + meta.warehouseType : '',
+    meta.seerfar ? 'seerfar补全' : '',
     meta.sellerName ? '卖家=' + meta.sellerName : '',
     meta.categoryPath ? '类目=' + String(meta.categoryPath).slice(0, 80) : '',
     meta.description ? '描述=' + String(meta.description).length + '字' : '',

@@ -6,6 +6,7 @@ import { RequirePermissions } from '../../common/decorators/auth.decorators';
 import { CurrentTenantId, CurrentUser } from '../../common/decorators/current.decorators';
 import { PageQueryDto } from '../../common/dto/page-query.dto';
 import { AuthUser } from '../auth/auth.types';
+import { BatchEstimatePackageDto, EstimatePackageDto } from './dto/estimate-package.dto';
 import { ProductService } from './product.service';
 
 class ProductQueryDto extends PageQueryDto {
@@ -237,6 +238,27 @@ export class ProductController {
     @Body() dto: BatchShelfDto,
   ) {
     return this.productService.shelfMany(user, tenantId, dto.productIds, dto);
+  }
+
+  @Post('package-estimate/batch')
+  @RequirePermissions('product:shelf')
+  estimatePackageBatch(
+    @CurrentUser() user: AuthUser,
+    @CurrentTenantId() tenantId: string | null,
+    @Body() dto: BatchEstimatePackageDto,
+  ) {
+    return this.productService.estimatePackageBatch(tenantId, user.id, dto.productIds, dto);
+  }
+
+  @Post(':id/package-estimate')
+  @RequirePermissions('product:shelf')
+  estimatePackage(
+    @CurrentUser() user: AuthUser,
+    @CurrentTenantId() tenantId: string | null,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Body() dto: EstimatePackageDto,
+  ) {
+    return this.productService.estimatePackage(tenantId, user.id, id, dto ?? {});
   }
 
   @Post('delete/batch')

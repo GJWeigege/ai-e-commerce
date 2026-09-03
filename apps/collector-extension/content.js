@@ -615,6 +615,50 @@ function addSpec(specs, name, value) {
   specs.push({ name: n, value: v });
 }
 
+function upsertSpec(specs, name, value) {
+  const n = specLabel(name);
+  const v = specLabel(value);
+  if (!n || !v || n.length > 80 || v.length > 800) return;
+  const idx = specs.findIndex((item) => item.name === n);
+  if (idx >= 0) specs[idx] = { name: n, value: v };
+  else specs.unshift({ name: n, value: v });
+}
+
+/** seerfar 面板在商品页注入后，用体积/重量/库存/配送/品牌补全公开页经常缺的字段 */
+function applySeerfarOverlay(product) {
+  if (!product || product.kind === 'listing') return product;
+  const overlay =
+    typeof window.__aiecomReadSeerfarOverlay === 'function'
+      ? window.__aiecomReadSeerfarOverlay(product.skuId)
+      : null;
+  if (!overlay) return product;
+  product.specs = Array.isArray(product.specs) ? product.specs : [];
+  if (overlay.depth && overlay.width && overlay.height) {
+    upsertSpec(product.specs, 'Длина упаковки, мм', String(Math.round(overlay.depth)));
+    upsertSpec(product.specs, 'Ширина упаковки, мм', String(Math.round(overlay.width)));
+    upsertSpec(product.specs, 'Высота упаковки, мм', String(Math.round(overlay.height)));
+    if (overlay.dimension) upsertSpec(product.specs, 'dimension', overlay.dimension);
+  }
+  if (overlay.weightGrams) upsertSpec(product.specs, 'Вес брутто, г', String(overlay.weightGrams));
+  if (overlay.brand) {
+    upsertSpec(product.specs, 'Бренд', overlay.brand);
+    if (!product.brand) product.brand = overlay.brand;
+  }
+  if (overlay.sellerName) upsertSpec(product.specs, 'Продавец', overlay.sellerName);
+  if (overlay.warehouseType) {
+    upsertSpec(product.specs, 'Склад отгрузки', overlay.warehouseType);
+    if (!product.warehouseType) product.warehouseType = overlay.warehouseType;
+  }
+  if (overlay.deliveryText) upsertSpec(product.specs, 'Срок доставки', overlay.deliveryText);
+  if (overlay.stock && overlay.stock > 0) {
+    const pageStock = Number(product.stock) || 0;
+    if (pageStock <= 1 || overlay.stock > pageStock) product.stock = overlay.stock;
+  }
+  if (overlay.salesCount && !(Number(product.salesCount) > 0)) product.salesCount = overlay.salesCount;
+  product.seerfarOverlay = true;
+  return product;
+}
+
 function extract(payload) {
   payload = payload || {};
   const jsonLdNodes = [];
@@ -1019,7 +1063,7 @@ function extract(payload) {
   if (!usable && isChallengePage()) return { blocked: true };
   const availability = collectAvailability(trees, price > 0 ? 1 : 0);
 
-  return {
+  return applySeerfarOverlay({
     skuId: String(sku || ''),
     name: trimmedName,
     sourceUrl: location.href,
@@ -1042,7 +1086,7 @@ function extract(payload) {
     rating: isFinite(rating) ? rating : undefined,
     reviewCount: reviewCount || undefined,
     salesCount: undefined,
-  };
+  });
 }
 
 async function fetchComposerPages() {

@@ -400,12 +400,21 @@ function isProductGalleryUrl(url) {
 }
 
 function mergeHarvest(product, harvest) {
-  product = mergeDimSpecs(product, harvest && harvest.dimSpecs);
+  const meta = harvest && harvest.meta && typeof harvest.meta === 'object' ? harvest.meta : {};
+  const keepOverlayPackaging = Boolean(product && product.seerfarOverlay) && !meta.seerfar;
+  product = mergeDimSpecs(product, harvest && harvest.dimSpecs, { keepOverlayPackaging });
   if (!product || product.kind === 'listing' || !harvest) {
     return product;
   }
-  const meta = harvest.meta && typeof harvest.meta === 'object' ? harvest.meta : {};
   if (meta.brand && !product.brand) product.brand = meta.brand;
+  if (meta.stock != null && Number(meta.stock) > 0) {
+    const pageStock = Number(product.stock) || 0;
+    if (pageStock <= 1 || Number(meta.stock) > pageStock) product.stock = Number(meta.stock);
+  }
+  if (meta.salesCount != null && Number(meta.salesCount) > 0 && !(Number(product.salesCount) > 0)) {
+    product.salesCount = Number(meta.salesCount);
+  }
+  if (meta.warehouseType && !product.warehouseType) product.warehouseType = meta.warehouseType;
   if (meta.description && (!product.description || product.description.length < String(meta.description).length)) {
     product.description = meta.description;
   }
@@ -437,13 +446,14 @@ function mergeHarvest(product, harvest) {
   if (meta.deliveryText) deliverySpecs.push({ name: 'Срок доставки', value: String(meta.deliveryText) });
   const fromDelivery = fulfillmentWarehouse(String(meta.deliveryWarehouse || '') + ' ' + String(meta.deliveryText || ''));
   if (fromDelivery && !product.warehouseType) product.warehouseType = fromDelivery;
-  return mergeDimSpecs(product, deliverySpecs);
+  return mergeDimSpecs(product, deliverySpecs, { keepOverlayPackaging });
 }
 
-function mergeDimSpecs(product, dimSpecs) {
+function mergeDimSpecs(product, dimSpecs, opts) {
   if (!product || product.kind === 'listing' || !Array.isArray(dimSpecs) || !dimSpecs.length) {
     return product;
   }
+  const keepOverlayPackaging = Boolean(opts && opts.keepOverlayPackaging);
   product.specs = Array.isArray(product.specs) ? product.specs : [];
   dimSpecs
     .slice()
@@ -453,8 +463,10 @@ function mergeDimSpecs(product, dimSpecs) {
       const value = String((spec && spec.value) || '').trim();
       if (!name || !value) return;
       const idx = product.specs.findIndex((item) => item.name === name);
-      if (idx >= 0) product.specs[idx] = { name, value };
-      else product.specs.unshift({ name, value });
+      if (idx >= 0) {
+        if (keepOverlayPackaging && /упаковк|брутто|^dimension$|склад отгрузки/i.test(name)) return;
+        product.specs[idx] = { name, value };
+      } else product.specs.unshift({ name, value });
     });
   return product;
 }
@@ -468,7 +480,7 @@ async function harvestOzonComposer(tabId, tabUrl) {
       chrome.scripting.executeScript({
         target: { tabId },
         world: 'MAIN',
-        files: ['ozon-harvest.js'],
+        files: ['seerfar-overlay.js', 'ozon-harvest.js'],
       }),
       15_000,
       'harvest inject timeout',
@@ -572,7 +584,7 @@ async function extractTab(tabId, limit) {
   }
   if (!result) {
     await withTimeout(
-      chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }),
+      chrome.scripting.executeScript({ target: { tabId }, files: ['seerfar-overlay.js', 'content.js'] }),
       15_000,
       '注入内容脚本超时',
     );

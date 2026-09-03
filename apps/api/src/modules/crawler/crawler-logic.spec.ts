@@ -10,7 +10,7 @@ import {
 } from '@aiecom/collector-core';
 import { detectCaptchaOrBlock } from '@aiecom/collector-core';
 import { withRetry, CaptchaDetectedError } from '@aiecom/collector-core';
-import { extractOzonProductFromHtml, buildSkuOptions, parseOzonWidgetPage, parseLabeledDescriptionSpecs, warehouseSpecsFromCharacteristics, collectOzonAvailability, expandOzonDeliveryStateIds, findOzonDeliveryLayoutWidgets, planOzonDeliveryWidgetPosts, queueOzonComposerWidgets } from '@aiecom/collector-core';
+import { extractOzonProductFromHtml, buildSkuOptions, parseOzonWidgetPage, parseLabeledDescriptionSpecs, warehouseSpecsFromCharacteristics, collectOzonAvailability, expandOzonDeliveryStateIds, findOzonDeliveryLayoutWidgets, planOzonDeliveryWidgetPosts, queueOzonComposerWidgets, parseSeerfarOverlayText, seerfarOverlayToSpecs, applySeerfarOverlayToProduct } from '@aiecom/collector-core';
 import { buildOzonCategoryListingUrl, extractOzonProductUrls, isOzonListingUrl, pickOzonProductUrls, toAllowedCollectUrl } from '@aiecom/collector-core';
 import { alignSkuOptions, combineFamilyListings, fillSkuOptionsFromVariants, inferWeightOption, inspectPackageDimensions, isSameOzonFamily, keepMainSkuOnly, ozonListingSlugFamily, productFamilyKey } from '@aiecom/shared';
 import { scoreProduct } from '@aiecom/llm-core';
@@ -470,6 +470,44 @@ describe('ozon html extract', () => {
     );
     expect(fromBlob.specs?.some((item) => item.name === 'Длина, мм' && item.value === '250')).toBe(true);
     expect(fromBlob.specs?.some((item) => item.name === 'Вес товара, г' && item.value === '800')).toBe(true);
+  });
+
+  it('does not turn firework burst height 20 м into warehouse height 2000mm', () => {
+    const extra = warehouseSpecsFromCharacteristics([
+      { name: 'Длина', value: '200 мм' },
+      { name: 'Ширина', value: '150 мм' },
+      { name: 'Высота подъема', value: '20 м' },
+      { name: 'Высота', value: 'до 20 метров' },
+      { name: 'Калибр', value: '0.8 дюймов' },
+    ]);
+    expect(extra.some((item) => item.name === 'Высота, мм' && Number(item.value) >= 2000)).toBe(false);
+    expect(extra.some((item) => item.name === 'Высота, мм' && item.value === '20')).toBe(false);
+
+    const product = extractOzonProductFromHtml(
+      `<html><head><script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product',
+        sku: '1270175884',
+        name: 'Салют фейерверк Снегурочка 36 залпов 0.8 дюймов P9079',
+        offers: { price: 3000 },
+      })}</script><script type="application/json">${JSON.stringify({
+        widgetStates: {
+          'webCharacteristics-1': JSON.stringify({
+            characteristicsList: [
+              { name: 'Высота подъема', values: ['20 м'] },
+              { name: 'Высота', values: ['до 20 метров'] },
+              { name: 'Калибр', values: ['0.8 дюймов'] },
+              { name: 'Длина, мм', values: ['200'] },
+              { name: 'Ширина, мм', values: ['150'] },
+              { name: 'Высота, мм', values: ['180'] },
+            ],
+          }),
+        },
+      })}</script></head><body><h1>Салют Снегурочка</h1></body></html>`,
+      'https://www.ozon.ru/product/salyut-feyerverk-snegurochka-36-zalpov-0-8-dyuymov-p9079-1270175884/',
+    );
+    const dims = inspectPackageDimensions(product.specs || [], { name: product.name });
+    expect(Math.max(dims.dimensions.length || 0, dims.dimensions.width || 0, dims.dimensions.height || 0)).toBeLessThanOrEqual(700);
+    expect(dims.dimensions.height).toBe(20);
   });
 
   it('reads ozon tracking dimension string and grams like seerfar 211x46x24mm / 49g', () => {
@@ -1314,6 +1352,82 @@ describe('ozon html extract', () => {
     expect(gaps.dimensions.length).toBeGreaterThan(0);
     expect(gaps.dimensions.width).toBeGreaterThan(0);
     expect(gaps.dimensions.height).toBeGreaterThan(0);
+  });
+
+  it('parses seerfar .quick-view Chinese labels into package weight, volume, stock and warehouse', () => {
+    const overlay = parseSeerfarOverlayText(`
+SKU：1270175884
+卖家实际售价：28 093.5 ₽
+近30天销量：117
+近30天销售额：370 817 ₽
+品牌：Фейерверк-Мастер
+卖家：Салют экспресс 本土
+配送：FBS
+配送时效：2-4天
+重量：1500 g
+体积：165x140x150mm
+类目：烟花
+库存：356
+`);
+    expect(overlay).toMatchObject({
+      skuId: '1270175884',
+      brand: 'Фейерверк-Мастер',
+      sellerName: 'Салют экспресс',
+      warehouseType: 'FBS',
+      deliveryText: '2-4天',
+      weightGrams: 1500,
+      depth: 165,
+      width: 140,
+      height: 150,
+      stock: 356,
+      salesCount: 117,
+    });
+    const gaps = inspectPackageDimensions(seerfarOverlayToSpecs(overlay!), { name: 'Салют' });
+    expect(gaps.missingSize).toBe(false);
+    expect(gaps.missingWeight).toBe(false);
+    expect(gaps.dimensions.length).toBe(17);
+    expect(gaps.dimensions.width).toBe(14);
+    expect(gaps.dimensions.height).toBe(15);
+    expect(gaps.dimensions.weightBrutto).toBe(1.5);
+
+    const product = applySeerfarOverlayToProduct(
+      {
+        skuId: '1270175884',
+        name: 'Салют',
+        sourceUrl: 'https://www.ozon.ru/product/1270175884/',
+        imageUrls: [],
+        price: 1,
+        currency: 'RUB',
+        stock: 1,
+        specs: [],
+        salesCount: 0,
+      },
+      overlay,
+    );
+    expect(product.stock).toBe(356);
+    expect(product.brand).toBe('Фейерверк-Мастер');
+    expect(product.warehouseType).toBe('FBS');
+    expect(product.salesCount).toBe(117);
+  });
+
+  it('ignores seerfar overlay when SKU does not match the open PDP', () => {
+    const overlay = parseSeerfarOverlayText('SKU：1111111111\n重量：1500 g\n体积：165x140x150mm\n库存：10\n');
+    const product = applySeerfarOverlayToProduct(
+      {
+        skuId: '1270175884',
+        name: 'Салют',
+        sourceUrl: 'https://www.ozon.ru/product/1270175884/',
+        imageUrls: [],
+        price: 1,
+        currency: 'RUB',
+        stock: 1,
+        specs: [],
+        salesCount: 0,
+      },
+      overlay,
+    );
+    expect(product.stock).toBe(1);
+    expect(product.specs).toEqual([]);
   });
 
   it('keeps Толщина / Размер / Вес as separate labeled specs', () => {

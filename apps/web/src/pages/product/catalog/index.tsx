@@ -20,6 +20,8 @@ import {
   canUnlistListing,
   deleteProduct,
   deleteProductsBatch,
+  estimateProductPackage,
+  estimateProductPackageBatch,
   fetchProducts,
   isWbListingBusy,
   linkShelfPriceFields,
@@ -88,6 +90,8 @@ export default function ProductCatalogPage() {
   const [wbSuggestions, setWbSuggestions] = useState<WbSubjectSuggestion[]>([]);
   const [wbSuggesting, setWbSuggesting] = useState(false);
   const [sharedCategoryPath, setSharedCategoryPath] = useState<string | null>(null);
+  const [estimatingId, setEstimatingId] = useState<string | null>(null);
+  const [estimatingBatch, setEstimatingBatch] = useState(false);
 
   useEffect(() => {
     fetchShopOptions('WILDBERRIES')
@@ -95,6 +99,55 @@ export default function ProductCatalogPage() {
       .catch((error: Error) => message.error(error.message));
   }, []);
 
+  const gapSelected = selectedRows.filter(productHasPackageGap);
+
+  async function runEstimate(product: Product, reloadPreview = false) {
+    setEstimatingId(product.id);
+    try {
+      const result = await estimateProductPackage(product.id, { persist: true });
+      message.success(
+        result.skipped
+          ? '尺寸和重量已完整'
+          : `已预估 ${result.estimate.length ?? '—'}×${result.estimate.width ?? '—'}×${result.estimate.height ?? '—'} cm / ${result.estimate.weightBrutto ?? '—'} kg`,
+      );
+      if (reloadPreview) {
+        setPreview(result.product);
+      }
+      if (shelfTarget?.mode === 'single' && shelfTarget.product.id === product.id) {
+        setShelfTarget({ ...shelfTarget, product: result.product });
+      }
+      actionRef.current?.reload();
+      return result.product;
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '预估失败');
+      return null;
+    } finally {
+      setEstimatingId(null);
+    }
+  }
+
+  async function runEstimateBatch(products: Product[]) {
+    const ids = products.filter(productHasPackageGap).map((item) => item.id);
+    if (!ids.length) {
+      message.warning('所选商品已有尺寸和重量');
+      return;
+    }
+    setEstimatingBatch(true);
+    try {
+      const result = await estimateProductPackageBatch(ids, { persist: true });
+      const ok = result.list.filter((item) => item.ok).length;
+      const failed = result.list.filter((item) => !item.ok);
+      message.success(`已预估 ${ok}/${result.list.length} 件`);
+      if (failed.length) {
+        message.warning(failed.map((item) => `${item.name}: ${item.error}`).slice(0, 3).join('；'));
+      }
+      actionRef.current?.reload();
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '批量预估失败');
+    } finally {
+      setEstimatingBatch(false);
+    }
+  }
   const sampleProduct = shelfTarget?.mode === 'single' ? shelfTarget.product : shelfTarget?.products[0];
   const listingPackageGaps = useMemo(() => {
     if (!shelfTarget?.onShelf) {
@@ -436,6 +489,18 @@ export default function ProductCatalogPage() {
           <a key="view" onClick={() => setPreview(row)}>
             详情
           </a>,
+          ...(hasPermission('product:shelf') && productHasPackageGap(row)
+            ? [
+                <Button
+                  key="estimate"
+                  type="link"
+                  loading={estimatingId === row.id}
+                  onClick={() => void runEstimate(row)}
+                >
+                  AI预估尺寸
+                </Button>,
+              ]
+            : []),
           ...(hasPermission('product:shelf') && canShowOnShelfAction(row)
             ? [
                 <Button
@@ -514,6 +579,14 @@ export default function ProductCatalogPage() {
         toolBarRender={() => [
           ...(hasPermission('product:shelf')
             ? [
+                <Button
+                  key="estimate-batch"
+                  disabled={!gapSelected.length}
+                  loading={estimatingBatch}
+                  onClick={() => void runEstimateBatch(gapSelected)}
+                >
+                  AI预估尺寸（{gapSelected.length}）
+                </Button>,
                 <Button key="batch" type="primary" disabled={!selectedRowKeys.length} onClick={openBatchShelf}>
                   批量上架（{selectedRowKeys.length}）
                 </Button>,
@@ -564,7 +637,14 @@ export default function ProductCatalogPage() {
           return { data: data.list, total: data.total, success: true };
         }}
       />
-      <ProductPreviewDrawer product={preview} onClose={() => setPreview(null)} />
+      <ProductPreviewDrawer
+        product={preview}
+        onClose={() => setPreview(null)}
+        onEstimated={(product) => {
+          setPreview(product);
+          actionRef.current?.reload();
+        }}
+      />
       <Modal
         title={
           shelfTarget?.onShelf
@@ -652,14 +732,30 @@ export default function ProductCatalogPage() {
         {pickerShops.length ? (
           <>
             {listingPackageGaps.length ? (
-              <PackageGapBanner
-                listing
-                gaps={{
-                  dimensions: {},
-                  missingSize: listingPackageGaps.some((item) => item.gaps.missingSize),
-                  missingWeight: listingPackageGaps.some((item) => item.gaps.missingWeight),
-                }}
-              />
+              <>
+                <PackageGapBanner
+                  listing
+                  gaps={{
+                    dimensions: {},
+                    missingSize: listingPackageGaps.some((item) => item.gaps.missingSize),
+                    missingWeight: listingPackageGaps.some((item) => item.gaps.missingWeight),
+                  }}
+                />
+                <Button
+                  type="primary"
+                  loading={estimatingBatch || Boolean(estimatingId)}
+                  style={{ marginBottom: 16 }}
+                  onClick={async () => {
+                    if (listingPackageGaps.length === 1) {
+                      await runEstimate(listingPackageGaps[0].product);
+                      return;
+                    }
+                    await runEstimateBatch(listingPackageGaps.map((item) => item.product));
+                  }}
+                >
+                  AI 预估缺失尺寸/重量
+                </Button>
+              </>
             ) : null}
             <Checkbox.Group
               style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}

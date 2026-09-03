@@ -89,9 +89,16 @@
     return String(text || '').replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
   }
 
+  function isNonPackageDim(name, value) {
+    const blob = normalizeCharKey(name) + ' ' + String(value || '').toLowerCase();
+    if (/подъем|эффект|полет|разрыв|взрыв|калибр|caliber|дюйм|inch|дальност/.test(blob)) return true;
+    return /до\s+\d+(?:[.,]\d+)?\s*(?:м(?!м)|метр)/i.test(String(value || ''));
+  }
+
   function isDimCharName(name) {
     const n = normalizeCharKey(name);
     if (/кольц|ringsize|длина в мм|диагональ|экран|ssd|весь ozon/.test(n)) return false;
+    if (isNonPackageDim(name)) return false;
     return /^(вес(?![а-яё])|вес,|вес товара|вес брутто|вес в упаков|вес нетто|масса(?![а-яё]))|длина|ширина|высота|глубина|толщина|weight|length|width|height|depth|габарит|размер|упаковк|объем|package/.test(
       n,
     );
@@ -688,7 +695,7 @@
     if (!buckets.edges.some((item) => item.pkg)) {
       const length = chars.find((row) => /длина|глубина|length|depth/.test(normalizeCharKey(row.name)));
       const width = chars.find((row) => /ширина|width/.test(normalizeCharKey(row.name)));
-      const height = chars.find((row) => /высота|толщина|height/.test(normalizeCharKey(row.name)));
+      const height = chars.find((row) => /высота|толщина|height/.test(normalizeCharKey(row.name)) && !isNonPackageDim(row.name, row.value));
       if (length && width && height) {
         const blob = length.name + ' ' + width.name + ' ' + height.name;
         const depth = edgeToMm(length, blob);
@@ -732,7 +739,7 @@
           const thickRow =
             parsed.height > 0
               ? null
-              : chars.find((row) => /^(высота|толщина)/i.test(row.name) && !/экран/i.test(row.name));
+              : chars.find((row) => /^(высота|толщина)/i.test(row.name) && !/экран/i.test(row.name) && !isNonPackageDim(row.name, row.value));
           const thick = thickRow ? namedToMm(thickRow.value, thickRow.name + ' ' + thickRow.value) : parsed.height;
           const fallback = Math.max(parsed.depth, parsed.width) >= 400 ? 20 : 0;
           const nextHeight = Math.max(1, Math.round(thick > 0 && thick < 5000 ? thick : fallback));
@@ -752,7 +759,7 @@
         chars.find((row) => /^длина/i.test(row.name) && !/экран|кольц|в мм/i.test(row.name)) ||
         chars.find((row) => /^(глубина|depth|length)/i.test(row.name) && !/экран/i.test(row.name));
       const width = chars.find((row) => /^(ширина|width)/i.test(row.name));
-      const height = chars.find((row) => /^(высота|толщина|height)/i.test(row.name) && !/экран/i.test(row.name));
+      const height = chars.find((row) => /^(высота|толщина|height)/i.test(row.name) && !/экран/i.test(row.name) && !isNonPackageDim(row.name, row.value));
       if (length && width && height) {
         const blob = length.name + ' ' + width.name + ' ' + height.name;
         const depth = edgeToMm(length, blob);
@@ -770,7 +777,7 @@
         });
         const wall = chars.find((row) => {
           const key = normalizeCharKey(row.name);
-          return /^(высота стенки|высота(?!.*крыш)|height)/.test(key) && !/толщина|экран/.test(key);
+          return /^(высота стенки|высота(?!.*крыш)|height)/.test(key) && !/толщина|экран/.test(key) && !isNonPackageDim(row.name, row.value);
         });
         if (diameter && wall) {
           const d = edgeToMm(diameter, diameter.name);
@@ -1091,6 +1098,54 @@
     return value || String(fallback || '').trim();
   }
 
+  function overlayReady(overlay) {
+    return Boolean(overlay && (overlay.weightGrams || overlay.depth || overlay.stock || overlay.brand || overlay.warehouseType));
+  }
+
+  async function waitSeerfarOverlay(pageSku, ms) {
+    const deadline = Date.now() + (ms || 0);
+    while (Date.now() <= deadline) {
+      const overlay =
+        typeof global.__aiecomReadSeerfarOverlay === 'function' ? global.__aiecomReadSeerfarOverlay(pageSku) : null;
+      if (overlayReady(overlay)) return overlay;
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    return typeof global.__aiecomReadSeerfarOverlay === 'function' ? global.__aiecomReadSeerfarOverlay(pageSku) : null;
+  }
+
+  /** seerfar 面板是发货口径，score 高于 Ozon 公开组件，用来补齐体积/重量/库存/品牌/仓型 */
+  function applySeerfarOverlayToBuckets(buckets, overlay) {
+    if (!overlay) return false;
+    const meta = buckets.meta || (buckets.meta = {});
+    if (overlay.depth && overlay.width && overlay.height) {
+      buckets.edges.push({
+        depth: overlay.depth,
+        width: overlay.width,
+        height: overlay.height,
+        score: 10,
+        pkg: true,
+      });
+    }
+    if (overlay.weightGrams) {
+      buckets.weights.push({ weight: overlay.weightGrams, score: 10, pkg: true });
+    }
+    if (overlay.dimension) {
+      buckets.chars.push({ name: 'dimension', value: overlay.dimension, score: 10 });
+    }
+    if (overlay.brand && !meta.brand) meta.brand = overlay.brand;
+    if (overlay.sellerName && !meta.sellerName) meta.sellerName = overlay.sellerName;
+    if (overlay.warehouseType) {
+      meta.warehouseType = overlay.warehouseType;
+      if (!meta.deliveryWarehouse) meta.deliveryWarehouse = overlay.warehouseType;
+    }
+    if (overlay.deliveryText && !meta.deliveryText) meta.deliveryText = overlay.deliveryText;
+    if (overlay.stock) meta.stock = overlay.stock;
+    if (overlay.salesCount) meta.salesCount = overlay.salesCount;
+    meta.seerfar = true;
+    return true;
+  }
+
   async function harvestOzon(productPath, pageSku) {
       const report = { dimSpecs: [], attrs: {}, imgUrls: [], fetches: [], error: '', pageCount: 0, debug: [] };
       try {
@@ -1354,6 +1409,9 @@
       ) {
         await new Promise((resolve) => setTimeout(resolve, 200));
       }
+      if (typeof global.__aiecomReadSeerfarOverlay === 'function' && !overlayReady(global.__aiecomReadSeerfarOverlay(sku))) {
+        await waitSeerfarOverlay(sku, 2000);
+      }
       document.querySelectorAll('[data-state]').forEach((node) => {
         const raw = node.getAttribute('data-state') || '';
         const widgetId = String(node.id || node.getAttribute('data-widget') || '');
@@ -1414,6 +1472,9 @@
       if (meta.sellerId) buckets.chars.push({ name: 'ID продавца', value: String(meta.sellerId), score: 0 });
       if (meta.brand) buckets.chars.push({ name: 'Бренд', value: meta.brand, score: 0 });
       if (meta.categoryPath) buckets.chars.push({ name: 'Категория', value: meta.categoryPath, score: 0 });
+      const seerfarOverlay =
+        typeof global.__aiecomReadSeerfarOverlay === 'function' ? global.__aiecomReadSeerfarOverlay(sku) : null;
+      const usedSeerfar = applySeerfarOverlayToBuckets(buckets, seerfarOverlay);
       applyPackageFromChars(buckets);
       applyWarehouseFromChars(buckets);
       report.dimSpecs = toDimSpecs(buckets).slice(0, 160);
@@ -1434,6 +1495,10 @@
         videoUrls: Array.isArray(meta.videoUrls) ? meta.videoUrls.slice(0, 8) : [],
         deliveryWarehouse: meta.deliveryWarehouse || '',
         deliveryText: meta.deliveryText || '',
+        stock: meta.stock || 0,
+        salesCount: meta.salesCount || 0,
+        warehouseType: meta.warehouseType || '',
+        seerfar: Boolean(meta.seerfar),
       };
       if (report.charNames.length && report.debug.length < 12) {
         report.debug.push({ key: 'chars', snippet: report.charNames.join(' | ').slice(0, 240) });
@@ -1441,13 +1506,30 @@
       if (Array.isArray(report.queuedWidgets) && report.queuedWidgets.length && report.debug.length < 12) {
         report.debug.push({ key: 'queued', snippet: report.queuedWidgets.join(', ').slice(0, 240) });
       }
+      if (usedSeerfar && report.debug.length < 12) {
+        report.debug.push({
+          key: 'seerfar',
+          snippet: [
+            seerfarOverlay && seerfarOverlay.dimension ? '体积 ' + seerfarOverlay.dimension : '',
+            seerfarOverlay && seerfarOverlay.weightGrams ? '重量 ' + seerfarOverlay.weightGrams + 'g' : '',
+            seerfarOverlay && seerfarOverlay.stock ? '库存 ' + seerfarOverlay.stock : '',
+            seerfarOverlay && seerfarOverlay.warehouseType ? '仓 ' + seerfarOverlay.warehouseType : '',
+            seerfarOverlay && seerfarOverlay.brand ? '品牌 ' + seerfarOverlay.brand : '',
+          ]
+            .filter(Boolean)
+            .join(' | ')
+            .slice(0, 240),
+        });
+      }
       const hasPkg = (report.dimSpecs || []).some((item) =>
-        /упаковк|брутто|длина,\s*мм|ширина,\s*мм|высота,\s*мм|вес товара/i.test(String(item.name || '')),
+        /упаковк|брутто|длина,\s*мм|ширина,\s*мм|высота,\s*мм|вес товара|dimension/i.test(String(item.name || '')),
       );
       if (!hasPkg && report.debug.length < 12) {
         report.debug.push({
           key: 'delivery',
-          snippet: 'Ozon public widgets had no dimension/weight; seerfar overlay is not on this PDP',
+          snippet: usedSeerfar
+            ? 'seerfar overlay present but package fields still incomplete'
+            : 'Ozon public widgets had no dimension/weight; seerfar overlay is not on this PDP',
         });
       }
     } catch (error) {

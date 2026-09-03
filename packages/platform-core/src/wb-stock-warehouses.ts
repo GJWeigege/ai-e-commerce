@@ -53,6 +53,60 @@ export function cargoTypesFromStockError(message: string): number[] | null {
   return null;
 }
 
+function positiveInt(value: unknown): number | undefined {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
+
+function readWarehousesByCargoType(value: unknown): Record<string, number> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  const result: Record<string, number> = {};
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    const id = positiveInt(raw);
+    if (id) {
+      result[key] = id;
+    }
+  }
+  return result;
+}
+
+/** 环境变量 / extra.warehouseId 是运营指定仓；按货型记住的仓只作回退，避免泉州仓之类自动覆盖 */
+export function resolveWbPreferredWarehouseId(options: {
+  extraWarehouseId?: unknown;
+  warehousesByCargoType?: Record<string, number>;
+  envWarehouseId?: unknown;
+  cargoType?: number;
+}): number | undefined {
+  const configured = positiveInt(options.envWarehouseId) ?? positiveInt(options.extraWarehouseId);
+  if (configured) {
+    return configured;
+  }
+  const byType = options.warehousesByCargoType || {};
+  if (options.cargoType === 2 || options.cargoType === 3) {
+    return positiveInt(byType['2']) ?? positiveInt(byType['3']);
+  }
+  if (options.cargoType === 1) {
+    return positiveInt(byType['1']);
+  }
+  return positiveInt(byType['1']) ?? positiveInt(byType['2']) ?? positiveInt(byType['3']);
+}
+
+/** 记住货型回退仓时，不覆盖已经指定的 extra.warehouseId */
+export function nextShopWarehouseExtra(
+  extra: Record<string, unknown>,
+  warehouseId: number,
+  cargoType?: number,
+): { warehouseId: number; warehousesByCargoType: Record<string, number> } {
+  const byType = readWarehousesByCargoType(extra.warehousesByCargoType);
+  const nextByType = cargoType ? { ...byType, [String(cargoType)]: warehouseId } : byType;
+  return {
+    warehouseId: positiveInt(extra.warehouseId) ?? warehouseId,
+    warehousesByCargoType: nextByType,
+  };
+}
+
 function cargoCompatible(warehouseType: number | undefined, needed?: number | number[]): boolean {
   if (needed == null) {
     return true;
@@ -85,6 +139,9 @@ export function rankWbStockWarehouses(
       }
       if (options?.preferredId && item.id === options.preferredId && compatible) {
         score += 80;
+      }
+      if (/泉州/.test(item.name)) {
+        score -= 300;
       }
       if (item.deliveryType === 1) {
         score += 50;

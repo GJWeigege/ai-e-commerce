@@ -5,9 +5,11 @@ import {
   collectWbChrtIds,
   createWbListingAdapter,
   inferWbCargoType,
+  nextShopWarehouseExtra,
   rankWbStockWarehouses,
   readWbSdkErrorBody,
   resetWbRateLimiters,
+  resolveWbPreferredWarehouseId,
 } from '@aiecom/platform-core';
 
 describe('WB seller-warehouse stocks', () => {
@@ -93,6 +95,34 @@ describe('WB seller-warehouse stocks', () => {
       { preferredId: 11, cargoType: 2 },
     );
     expect(ranked.map((item) => item.id)).toEqual([22, 33, 11]);
+  });
+
+  it('ranks the pinned warehouse ahead of 泉州仓 when cargo types match', () => {
+    const ranked = rankWbStockWarehouses(
+      [
+        { id: 1797873, name: '泉州仓', cargoType: 1, deliveryType: 1 },
+        { id: 1816127, name: 'FBS 1816127', cargoType: 1, deliveryType: 1 },
+      ],
+      { preferredId: 1816127, cargoType: 1 },
+    );
+    expect(ranked.map((item) => item.id)[0]).toBe(1816127);
+  });
+
+  it('does not let a remembered 泉州仓 override the configured warehouse id', () => {
+    expect(
+      resolveWbPreferredWarehouseId({
+        extraWarehouseId: 1797873,
+        warehousesByCargoType: { '1': 1797873, '2': 2106641 },
+        envWarehouseId: 1816127,
+        cargoType: 1,
+      }),
+    ).toBe(1816127);
+  });
+
+  it('keeps the configured warehouse id when remembering a cargo-type fallback', () => {
+    const next = nextShopWarehouseExtra({ warehouseId: 1816127, warehousesByCargoType: { '1': 1816127 } }, 2106641, 2);
+    expect(next.warehouseId).toBe(1816127);
+    expect(next.warehousesByCargoType).toEqual({ '1': 1816127, '2': 2106641 });
   });
 
   it('reads ODC/CD+ warehouse restriction from WB stock errors', () => {

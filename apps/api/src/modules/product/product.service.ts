@@ -8,9 +8,16 @@ import {
 } from '@aiecom/shared';
 import {
   OpenAiCompatibleProvider,
+  PACKAGE_ESTIMATE_PROMPT_VERSION,
   SELECTION_PROMPT_VERSION,
+  buildPackageEstimatePrompt,
   buildSelectionPrompt,
+  inspectEstimateProduct,
+  mergeEstimatedPackageSpecs,
+  parseJsonFromAgentText,
+  parsePackageEstimateOutput,
   parseSelectionOutput,
+  stripAiPackageSpecs,
 } from '@aiecom/llm-core';
 import {
   collectImageUrls,
@@ -30,6 +37,8 @@ import { requireTenantId } from '../../common/tenant/tenant-scope';
 import { QUEUE_WB_LISTING } from '../../queues/queue.constants';
 import { AuthUser } from '../auth/auth.types';
 import { canListProduct, canUnlistShopListing, PRODUCT_CATALOG_STATUSES } from './product-status';
+import { CursorAgentClient } from './cursor-agent.client';
+import { EstimatePackageDto } from './dto/estimate-package.dto';
 import { WbCategoryMappingService } from './wb-category-mapping.service';
 import { WbListingAdapterFactory } from './wb-listing-adapter.factory';
 
@@ -87,6 +96,7 @@ export class ProductService {
     private readonly shopAccess: ShopAccessService,
     private readonly categoryMappings: WbCategoryMappingService,
     private readonly adapters: WbListingAdapterFactory,
+    private readonly cursorAgent: CursorAgentClient,
     @Optional() @InjectQueue(QUEUE_WB_LISTING) private readonly listingQueue?: Queue,
   ) {}
 
@@ -204,6 +214,110 @@ export class ProductService {
       },
     });
     return updated;
+  }
+
+  async estimatePackage(
+    tenantId: string | null,
+    userId: string,
+    id: string,
+    dto: EstimatePackageDto = {},
+  ) {
+    const tid = requireTenantId(tenantId);
+    const persist = dto.persist !== false;
+    const product = await this.prisma.product.findFirst({ where: { id, tenantId: tid } });
+    if (!product) {
+      throw new NotFoundException('商品不存在');
+    }
+    const result = await this.estimateProductRecord(product, dto.force === true);
+    if (persist && !result.skipped && result.specs) {
+      await this.prisma.product.update({
+        where: { id },
+        data: { specs: result.specs as Prisma.InputJsonValue },
+      });
+      await this.prisma.productReview.create({
+        data: {
+          tenantId: tid,
+          productId: id,
+          reviewerId: userId,
+          action: 'EDIT',
+          remark: result.estimate.reason || 'AI 预估包裹尺寸/重量',
+          snapshot: {
+            source: 'cursor-sdk',
+            promptVersion: PACKAGE_ESTIMATE_PROMPT_VERSION,
+            estimate: result.estimate,
+            runId: result.runId,
+          } as Prisma.InputJsonValue,
+        },
+      });
+    }
+    const hydrated = await this.detail(tid, id);
+    return {
+      product: hydrated,
+      estimate: result.estimate,
+      gaps: result.gaps,
+      persisted: persist && !result.skipped,
+      skipped: result.skipped,
+    };
+  }
+
+  async estimatePackageBatch(
+    tenantId: string | null,
+    userId: string,
+    productIds: string[],
+    dto: EstimatePackageDto = {},
+  ) {
+    const tid = requireTenantId(tenantId);
+    const unique = [...new Set(productIds.map((id) => String(id || '').trim()).filter(Boolean))];
+    if (!unique.length) {
+      throw new BadRequestException('请选择要预估的商品');
+    }
+    if (unique.length > 20) {
+      throw new BadRequestException('单次最多预估 20 件商品');
+    }
+    const products = await this.prisma.product.findMany({
+      where: { id: { in: unique }, tenantId: tid },
+      select: { id: true, skuId: true, name: true },
+    });
+    if (products.length !== unique.length) {
+      throw new NotFoundException('部分商品不存在或无权访问');
+    }
+    const byId = new Map(products.map((item) => [item.id, item]));
+    const list: Array<{
+      productId: string;
+      skuId: string;
+      name: string;
+      ok: boolean;
+      skipped?: boolean;
+      persisted?: boolean;
+      error?: string;
+      estimate?: unknown;
+      gaps?: unknown;
+    }> = [];
+    for (const id of unique) {
+      const meta = byId.get(id)!;
+      try {
+        const result = await this.estimatePackage(tid, userId, id, dto);
+        list.push({
+          productId: id,
+          skuId: meta.skuId,
+          name: meta.name,
+          ok: true,
+          skipped: result.skipped,
+          persisted: result.persisted,
+          estimate: result.estimate,
+          gaps: result.gaps,
+        });
+      } catch (error) {
+        list.push({
+          productId: id,
+          skuId: meta.skuId,
+          name: meta.name,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    return { list };
   }
 
   async remove(tenantId: string | null, ids: string[]): Promise<{ count: number }> {
@@ -864,6 +978,76 @@ export class ProductService {
 
   private async loadProduct(tenantId: string, id: string) {
     return this.detail(tenantId, id);
+  }
+
+  private async estimateProductRecord(
+    product: {
+      id: string;
+      skuId: string;
+      name: string;
+      categoryPath: string | null;
+      brand: string | null;
+      description: string | null;
+      specs: Prisma.JsonValue;
+      skuOptions: Prisma.JsonValue;
+    },
+    force: boolean,
+  ) {
+    const specs = force ? stripAiPackageSpecs(this.asSpecs(product.specs)) : this.asSpecs(product.specs);
+    const skuOptions = this.asSkuOptions(product.skuOptions);
+    const input = {
+      skuId: product.skuId,
+      name: product.name,
+      categoryPath: product.categoryPath,
+      brand: product.brand,
+      description: product.description,
+      specs,
+      skuOptions,
+    };
+    const gaps = inspectEstimateProduct(input);
+    if (!gaps.missingSize && !gaps.missingWeight) {
+      return {
+        skipped: true,
+        specs,
+        gaps,
+        runId: '',
+        estimate: {
+          ...gaps.dimensions,
+          confidence: 1,
+          categoryHint: product.categoryPath || '',
+          reason: '采集已包含完整尺寸和重量，未调用 Cursor Agent',
+          assumptions: [],
+          source: 'collected',
+          model: '',
+        },
+      };
+    }
+    const prompt = buildPackageEstimatePrompt(input, gaps);
+    const agent = await this.cursorAgent.completeText(prompt);
+    const parsed = parsePackageEstimateOutput(parseJsonFromAgentText(agent.text));
+    if (gaps.missingSize && !(parsed.length && parsed.width && parsed.height)) {
+      throw new BadRequestException('Cursor Agent 未给出完整包装长宽高');
+    }
+    if (gaps.missingWeight && !parsed.weightBrutto) {
+      throw new BadRequestException('Cursor Agent 未给出包装毛重');
+    }
+    const merged = mergeEstimatedPackageSpecs(specs, parsed, gaps, {
+      source: 'cursor-sdk',
+      model: agent.model,
+    });
+    return {
+      skipped: false,
+      specs: merged,
+      gaps: inspectEstimateProduct({ ...input, specs: merged }),
+      runId: agent.runId,
+      estimate: {
+        ...parsed,
+        source: 'cursor-sdk',
+        model: agent.model,
+        promptVersion: PACKAGE_ESTIMATE_PROMPT_VERSION,
+        runId: agent.runId,
+      },
+    };
   }
 
   private asSpecs(value: unknown): Array<{ name: string; value: string }> {

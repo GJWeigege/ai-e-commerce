@@ -34,6 +34,39 @@ const PACK_MIN_KG = 0.1;
 const PACK_RATIO = 0.2;
 /** 商品口径边长转发货口径：每边加 2cm，覆盖纸箱板厚与缠膜。已是包裹口径的边不再叠加 */
 const PACK_EDGE_CM = 2;
+/** WB 包裹边长上限（cm）。烟花「升空 20 м」曾被乘 100 再加包装余量变成 2002 */
+export const WB_MAX_PACKAGE_EDGE_CM = 700;
+
+function hasInchUnit(text: string): boolean {
+  return /дюйм|inch/i.test(text);
+}
+
+/** 只认独立的 м / метр / meter，避免 диаметр、размер、дюйм 里的「м」被当成米 */
+function hasMeterUnit(text: string): boolean {
+  const src = String(text || '')
+    .toLowerCase()
+    .replace(/ё/g, 'е');
+  if (hasInchUnit(src) || /см|cm/i.test(src)) {
+    return false;
+  }
+  return /(?:^|[^a-zа-яё])(?:метр(?:а|ов)?|meters?|metres?|м(?![мa-zа-яё]))(?![a-zа-яё])/i.test(src);
+}
+
+function clampPackageEdgeCm(cm: number): number | null {
+  if (!Number.isFinite(cm) || cm <= 0 || cm > WB_MAX_PACKAGE_EDGE_CM) {
+    return null;
+  }
+  return cm;
+}
+
+/** 烟花升空高度、口径英寸等不是包裹边长 */
+export function isNonPackageDimensionSpec(name: string, value = ''): boolean {
+  const blob = `${normalizeKey(name)} ${String(value || '').toLowerCase()}`;
+  if (/подъем|эффект|полет|разрыв|взрыв|калибр|caliber|дюйм|inch|дальност/.test(blob)) {
+    return true;
+  }
+  return /до\s+\d+(?:[.,]\d+)?\s*(?:м(?!м)|метр)/i.test(String(value || ''));
+}
 
 export function parseDimensionNumber(
   raw: string,
@@ -55,13 +88,16 @@ export function parseDimensionNumber(
     }
     return num;
   }
+  if (isNonPackageDimensionSpec(context, value)) {
+    return null;
+  }
   if (/мм|mm/i.test(text)) {
-    return Math.max(0.1, num / 10);
+    return clampPackageEdgeCm(Math.max(0.1, num / 10));
   }
-  if (/м(?!м)|m\b/i.test(text) && !/см|cm/i.test(text)) {
-    return Math.max(1, num * 100);
+  if (hasMeterUnit(text)) {
+    return clampPackageEdgeCm(Math.max(1, num * 100));
   }
-  return num;
+  return clampPackageEdgeCm(num);
 }
 
 function looksLikeCombinedSize(value: string): boolean {
@@ -85,7 +121,7 @@ function parseCombinedSize(text: string): { length: number; width: number; heigh
       return unit === 'мм' || unit === 'mm' ? num / 10 : num;
     };
     const edges = [toCm(match[1]), toCm(match[2]), match[3] ? toCm(match[3]) : 0]
-      .filter((item) => item > 0)
+      .filter((item) => item > 0 && item <= WB_MAX_PACKAGE_EDGE_CM)
       .sort((a, b) => b - a);
     if (!edges.length) {
       continue;
@@ -219,6 +255,9 @@ export function mapPackageDimensions(
     if (/крышк|покрыт/.test(key) && /диаметр|diameter|размер/.test(key)) {
       continue;
     }
+    if (isNonPackageDimensionSpec(spec.name, spec.value)) {
+      continue;
+    }
     if (looksLikeCombinedSize(spec.value) && !DIM_KEYS.weight.some((alias) => key.includes(alias))) {
       continue;
     }
@@ -250,11 +289,11 @@ export function mapPackageDimensions(
   const hasNamedSize = Boolean(found.length && found.width && found.height);
   if (!hasNamedSize) {
     for (const spec of rows) {
-      if (isApparelSizeName(spec.name, spec.value)) {
+      if (isApparelSizeName(spec.name, spec.value) || isNonPackageDimensionSpec(spec.name, spec.value)) {
         continue;
       }
       const looksLikeTrackingTriple =
-        /^(dimension|volume|габарит)/i.test(normalizeKey(spec.name)) &&
+        /^(dimension|volume|габарит|体积)/i.test(normalizeKey(spec.name)) &&
         !/(см|mm|мм|cm)/i.test(spec.value) &&
         (String(spec.value).match(/\d+/g) || []).length >= 3;
       const combined = parseCombinedSize(
@@ -300,8 +339,10 @@ export function mapPackageDimensions(
     weightKg = toGrossKg(found.weightBrutto);
   }
 
-  const toShippingEdge = (value: number) =>
-    Math.max(1, Math.ceil(hasExplicitPackageSize ? value : value + PACK_EDGE_CM));
+  const toShippingEdge = (value: number) => {
+    const packed = Math.max(1, Math.ceil(hasExplicitPackageSize ? value : value + PACK_EDGE_CM));
+    return packed > WB_MAX_PACKAGE_EDGE_CM ? Math.min(WB_MAX_PACKAGE_EDGE_CM, Math.ceil(value)) : packed;
+  };
 
   return {
     ...(found.length > 0 ? { length: toShippingEdge(found.length) } : {}),

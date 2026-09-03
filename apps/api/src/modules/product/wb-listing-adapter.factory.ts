@@ -1,6 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import { PlatformAccount, Prisma } from '@prisma/client';
-import { createWbListingAdapter, IWbListingAdapter, sharedWbCatalogStore } from '@aiecom/platform-core';
+import {
+  createWbListingAdapter,
+  IWbListingAdapter,
+  nextShopWarehouseExtra,
+  resolveWbPreferredWarehouseId,
+  sharedWbCatalogStore,
+} from '@aiecom/platform-core';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { ShopAccessService } from '../../common/shop/shop-access.service';
 
@@ -33,21 +39,15 @@ export class WbListingAdapterFactory {
     });
   }
 
+  /** 运营指定仓（env / extra.warehouseId）优先，避免货型记忆把库存写到泉州仓 */
   warehouseId(shop: PlatformAccount, cargoType?: number): number | undefined {
     const extra = this.extra(shop.extra);
-    const byType = this.warehousesByCargoType(extra);
-    if (cargoType === 2 || cargoType === 3) {
-      return (
-        positiveInt(byType['2']) ??
-        positiveInt(byType['3']) ??
-        positiveInt(extra.warehouseId) ??
-        positiveInt(process.env.WB_WAREHOUSE_ID)
-      );
-    }
-    if (cargoType === 1) {
-      return positiveInt(byType['1']) ?? positiveInt(extra.warehouseId) ?? positiveInt(process.env.WB_WAREHOUSE_ID);
-    }
-    return positiveInt(extra.warehouseId) ?? positiveInt(process.env.WB_WAREHOUSE_ID);
+    return resolveWbPreferredWarehouseId({
+      extraWarehouseId: extra.warehouseId,
+      warehousesByCargoType: this.warehousesByCargoType(extra),
+      envWarehouseId: process.env.WB_WAREHOUSE_ID,
+      cargoType,
+    });
   }
 
   brand(shop: PlatformAccount): string | undefined {
@@ -62,14 +62,20 @@ export class WbListingAdapterFactory {
       return;
     }
     const extra = this.extra(shop.extra);
+    const next = nextShopWarehouseExtra(extra, warehouseId, cargoType);
     const byType = this.warehousesByCargoType(extra);
-    const nextByType = cargoType ? { ...byType, [String(cargoType)]: warehouseId } : byType;
-    if (Number(extra.warehouseId) === warehouseId && JSON.stringify(byType) === JSON.stringify(nextByType)) {
+    if (Number(extra.warehouseId) === next.warehouseId && JSON.stringify(byType) === JSON.stringify(next.warehousesByCargoType)) {
       return;
     }
     await this.prisma.platformAccount.update({
       where: { id: shopId },
-      data: { extra: { ...extra, warehouseId, warehousesByCargoType: nextByType } as Prisma.InputJsonValue },
+      data: {
+        extra: {
+          ...extra,
+          warehouseId: next.warehouseId,
+          warehousesByCargoType: next.warehousesByCargoType,
+        } as Prisma.InputJsonValue,
+      },
     });
   }
 

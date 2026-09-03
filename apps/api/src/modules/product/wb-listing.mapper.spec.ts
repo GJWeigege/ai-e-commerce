@@ -240,6 +240,45 @@ describe('wb listing mapper', () => {
     });
   });
 
+  it('does not treat firework burst height or caliber as a 2002cm package edge', () => {
+    const dims = mapWbDimensions(
+      [
+        { name: 'Высота подъема', value: '20 м' },
+        { name: 'Высота', value: 'до 20 метров' },
+        { name: 'Калибр', value: '0.8 дюймов' },
+        { name: 'Длина, мм', value: '200' },
+        { name: 'Ширина, мм', value: '150' },
+        { name: 'Высота, мм', value: '180' },
+        { name: 'Вес товара, г', value: '800' },
+      ],
+      { name: 'Салют фейерверк Снегурочка 36 залпов 0.8 дюймов P9079' },
+    );
+    expect(Math.max(dims.length || 0, dims.width || 0, dims.height || 0)).toBeLessThanOrEqual(700);
+    expect(dims.length).toBe(22);
+    expect(dims.width).toBe(17);
+    expect(dims.height).toBe(20);
+    expect(dims.weightBrutto).toBeGreaterThanOrEqual(0.9);
+    const fromCaliber = mapWbDimensions(
+      [
+        { name: 'Диаметр', value: '20' },
+        { name: 'Высота', value: 'до 20 метров' },
+      ],
+      { name: 'Салют Снегурочка 36 залпов 0.8 дюймов' },
+    );
+    expect(Math.max(fromCaliber.length || 0, fromCaliber.width || 0, fromCaliber.height || 0)).toBeLessThanOrEqual(700);
+    expect(fromCaliber.length).not.toBe(2002);
+    expect(fromCaliber.height).not.toBe(2002);
+  });
+
+  it('still converts a real meter package edge such as 1.5 м', () => {
+    expect(
+      mapWbDimensions([{ name: 'Длина', value: '1.5 м' }, { name: 'Ширина', value: '80 см' }]),
+    ).toEqual({
+      length: 152,
+      width: 82,
+    });
+  });
+
   it('maps cookware diameter plus wall height to a square package and does not invent weight', () => {
     expect(
       mapWbDimensions([

@@ -1,7 +1,9 @@
-import { Descriptions, Drawer, Image, Tag, Typography } from 'antd';
-import { Product, productDescription, productSpecs, productVariants } from '../../services/product';
+import { Button, Descriptions, Drawer, Image, Tag, Typography, message } from 'antd';
+import { useState } from 'react';
+import { Product, estimateProductPackage, productDescription, productSpecs, productVariants } from '../../services/product';
 import { inspectProductPackage } from '../../services/package-dims';
 import { PackageGapBanner, PACKAGE_GAP_STYLE } from './PackageGapNotice';
+import { useAuth } from '../../auth';
 
 function isHttpsUrl(src: string) {
   try {
@@ -14,10 +16,14 @@ function isHttpsUrl(src: string) {
 export function ProductPreviewDrawer({
   product,
   onClose,
+  onEstimated,
 }: {
   product: Product | null;
   onClose: () => void;
+  onEstimated?: (product: Product) => void;
 }) {
+  const { hasPermission } = useAuth();
+  const [estimating, setEstimating] = useState(false);
   const variants = product ? productVariants(product) : [];
   const images = (product?.imageUrls?.length
     ? product.imageUrls
@@ -29,6 +35,10 @@ export function ProductPreviewDrawer({
   const description = product ? productDescription(product) || product.description || '' : '';
   const packageGaps = product ? inspectProductPackage(product) : null;
   const dims = packageGaps?.dimensions;
+  const canEstimate =
+    Boolean(product) &&
+    hasPermission('product:shelf') &&
+    Boolean(packageGaps && (packageGaps.missingSize || packageGaps.missingWeight));
 
   return (
     <Drawer title={product?.name} width={760} open={Boolean(product)} onClose={onClose} destroyOnClose>
@@ -51,6 +61,32 @@ export function ProductPreviewDrawer({
             <Typography.Text type="secondary">暂无图集</Typography.Text>
           )}
           {packageGaps ? <PackageGapBanner gaps={packageGaps} /> : null}
+          {canEstimate ? (
+            <Button
+              type="primary"
+              loading={estimating}
+              style={{ marginBottom: 16 }}
+              onClick={async () => {
+                if (!product) return;
+                setEstimating(true);
+                try {
+                  const result = await estimateProductPackage(product.id, { persist: true });
+                  message.success(
+                    result.skipped
+                      ? '尺寸和重量已完整'
+                      : `已写入预估 ${result.estimate.length ?? '—'}×${result.estimate.width ?? '—'}×${result.estimate.height ?? '—'} cm / ${result.estimate.weightBrutto ?? '—'} kg`,
+                  );
+                  onEstimated?.(result.product);
+                } catch (error) {
+                  message.error(error instanceof Error ? error.message : '预估失败');
+                } finally {
+                  setEstimating(false);
+                }
+              }}
+            >
+              AI 预估包裹尺寸/重量
+            </Button>
+          ) : null}
           <Descriptions size="small" column={2} style={{ marginBottom: 16 }}>
             <Descriptions.Item label="实际销售价">
               {product.price} {product.currency || 'RUB'}

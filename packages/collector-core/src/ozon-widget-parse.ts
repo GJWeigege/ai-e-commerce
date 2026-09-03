@@ -1,4 +1,4 @@
-import type { ProductSpec } from '@aiecom/shared';
+import { isNonPackageDimensionSpec, type ProductSpec } from '@aiecom/shared';
 
 export function widgetName(key: string): string {
   return String(key || '').split('-')[0];
@@ -264,7 +264,7 @@ export function warehouseSpecsFromCharacteristics(specs: ProductSpec[]): Product
     const named = { length: '', width: '', height: '' };
     for (const spec of specs) {
       const key = normCharName(spec.name);
-      if (SKIP_SIZE_RE.test(key)) {
+      if (SKIP_SIZE_RE.test(key) || isNonPackageDimensionSpec(spec.name, spec.value)) {
         continue;
       }
       if (/длина/.test(key) && !named.length) {
@@ -289,7 +289,7 @@ export function warehouseSpecsFromCharacteristics(specs: ProductSpec[]): Product
     if (!extra.length) {
       for (const spec of specs) {
         const key = normCharName(spec.name);
-        if (SKIP_SIZE_RE.test(key) || !SIZE_NAME_RE.test(key) || !looksLikePhysicalSizeValue(spec.value)) {
+        if (SKIP_SIZE_RE.test(key) || isNonPackageDimensionSpec(spec.name, spec.value) || !SIZE_NAME_RE.test(key) || !looksLikePhysicalSizeValue(spec.value)) {
           continue;
         }
         const parsed = parseDimensionMm(spec.value);

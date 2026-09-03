@@ -252,6 +252,60 @@ export function deleteProductsBatch(ids: string[]) {
   });
 }
 
+export type PackageEstimate = {
+  length?: number;
+  width?: number;
+  height?: number;
+  weightBrutto?: number;
+  confidence: number;
+  categoryHint: string;
+  reason: string;
+  assumptions: string[];
+  source: string;
+  model: string;
+};
+
+export type PackageEstimateResult = {
+  product: Product;
+  estimate: PackageEstimate;
+  gaps: {
+    dimensions: { length?: number; width?: number; height?: number; weightBrutto?: number };
+    missingSize: boolean;
+    missingWeight: boolean;
+  };
+  persisted: boolean;
+  skipped: boolean;
+};
+
+export type PackageEstimateBatchItem = {
+  productId: string;
+  skuId: string;
+  name: string;
+  ok: boolean;
+  skipped?: boolean;
+  persisted?: boolean;
+  error?: string;
+  estimate?: PackageEstimate;
+  gaps?: PackageEstimateResult['gaps'];
+};
+
+export function estimateProductPackage(id: string, body: { persist?: boolean; force?: boolean } = {}) {
+  return request<PackageEstimateResult>(`/api/v1/products/${id}/package-estimate`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function estimateProductPackageBatch(
+  productIds: string[],
+  body: { persist?: boolean; force?: boolean } = {},
+) {
+  return request<{ list: PackageEstimateBatchItem[] }>('/api/v1/products/package-estimate/batch', {
+    method: 'POST',
+    body: JSON.stringify({ ...body, productIds }),
+  });
+}
+
 export type WbShelfPricePreview = {
   listPrice: number;
   salePrice: number;
