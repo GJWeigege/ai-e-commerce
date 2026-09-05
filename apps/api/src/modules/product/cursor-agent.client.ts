@@ -38,7 +38,7 @@ export class CursorAgentClient {
       throw new BadRequestException('未配置 CURSOR_API_KEY，无法调用 Cursor Agent 预估包裹');
     }
     const model = process.env.CURSOR_MODEL?.trim() || 'composer-2.5';
-    const runtime = (process.env.CURSOR_AGENT_RUNTIME || 'cloud').trim().toLowerCase();
+    const runtime = (process.env.CURSOR_AGENT_RUNTIME || 'local').trim().toLowerCase();
     const order = runtime === 'local' ? (['local', 'cloud'] as const) : (['cloud', 'local'] as const);
 
     let lastError: unknown;
@@ -82,17 +82,19 @@ export class CursorAgentClient {
     model: string,
     runtime: 'cloud' | 'local',
   ): Promise<{ text: string; model: string; runId: string }> {
+    const useFast = process.env.CURSOR_MODEL_FAST !== 'false';
+    const modelSel = useFast ? { id: model, params: [{ id: 'fast', value: 'true' }] } : { id: model };
     const options =
       runtime === 'local'
         ? {
             apiKey,
-            model: { id: model },
+            model: modelSel,
             local: { cwd: process.cwd() },
             tools: [] as string[],
           }
         : {
             apiKey,
-            model: { id: model },
+            model: modelSel,
             cloud: { repos: [] as Array<{ url: string }> },
           };
     const result = await Agent.prompt(prompt, options);
@@ -103,8 +105,9 @@ export class CursorAgentClient {
     if (!text) {
       throw new BadRequestException('Cursor Agent 未返回预估结果');
     }
-    this.logger.log(`package-estimate run=${result.id} model=${model} runtime=${runtime}`);
-    return { text, model, runId: result.id };
+    const modelLabel = useFast ? `${model}-fast` : model;
+    this.logger.log(`package-estimate run=${result.id} model=${modelLabel} runtime=${runtime}`);
+    return { text, model: modelLabel, runId: result.id };
   }
 
   /** Privacy Mode 挡住 Agent API 时，用已有 LLM 选品通道补预估，避免业务卡死 */

@@ -17,6 +17,7 @@ import {
   parseJsonFromAgentText,
   parsePackageEstimateOutput,
   parseSelectionOutput,
+  refinePackedEstimate,
   stripAiPackageSpecs,
 } from '@aiecom/llm-core';
 import {
@@ -1024,7 +1025,7 @@ export class ProductService {
     }
     const prompt = buildPackageEstimatePrompt(input, gaps);
     const agent = await this.cursorAgent.completeText(prompt);
-    const parsed = parsePackageEstimateOutput(parseJsonFromAgentText(agent.text));
+    const parsed = refinePackedEstimate(input, parsePackageEstimateOutput(parseJsonFromAgentText(agent.text)));
     if (gaps.missingSize && !(parsed.length && parsed.width && parsed.height)) {
       throw new BadRequestException('Cursor Agent 未给出完整包装长宽高');
     }
